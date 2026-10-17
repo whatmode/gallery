@@ -102,6 +102,9 @@ class CrewViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** Gallery loads the model itself; this just notes the state in the debug log. */
+    fun checkModel() { DebugLog.d("model", "re-check: ${modelStatus.value}") }
+
     // ---- files --------------------------------------------------------------------------------
 
     private fun tray(@Suppress("UNUSED_PARAMETER") t: Tray) = _crewFiles
