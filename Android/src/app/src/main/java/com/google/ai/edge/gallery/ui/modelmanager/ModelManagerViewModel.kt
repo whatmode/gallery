@@ -1292,7 +1292,8 @@ constructor(
 
         if (modelAllowlist == null) {
           // Load from github.
-          var version = BuildConfig.VERSION_NAME.replace(".", "_")
+          // Crew Gallery versions carry a "-crew.N" suffix; the model list is per upstream version.
+          var version = BuildConfig.VERSION_NAME.substringBefore("-").replace(".", "_")
           val url = getAllowlistUrl(version)
           Log.d(TAG, "Loading model allowlist from internet. Url: $url")
           val data = getJsonResponse<ModelAllowlist>(url = url)

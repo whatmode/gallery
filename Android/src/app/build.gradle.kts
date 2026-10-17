@@ -36,15 +36,15 @@ android {
     applicationId = "ua.volodymyr.crewgallery"
     minSdk = 31
     targetSdk = 37
-    versionCode = 46
-    versionName = "1.0.20-crew.1"
+    versionCode = 47
+    versionName = "1.0.20-crew.2"
 
     // Needed for HuggingFace auth workflows.
     // Use the scheme of the "Redirect URLs" in HuggingFace app.
     manifestPlaceholders["appAuthRedirectScheme"] =
         "REPLACE_WITH_YOUR_REDIRECT_SCHEME_IN_HUGGINGFACE_APP"
     manifestPlaceholders["applicationName"] = "com.google.ai.edge.gallery.GalleryApplication"
-    manifestPlaceholders["appIcon"] = "@mipmap/ic_launcher"
+    manifestPlaceholders["appIcon"] = "@mipmap/ic_crew_launcher"
 
     buildConfigField("String", "FEEDBACK_API_KEY", "\"\"")
 

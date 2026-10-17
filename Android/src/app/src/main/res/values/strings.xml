@@ -34,8 +34,8 @@
   <string name="aichat_initializing_content" translatable="true" description="Loading message shown while a chat or translator session is initializing. [CHAR_LIMIT=110]">Sit tight, this can take up to 1 minute</string>
   <string name="app_intro" translatable="true" description="Introduction text shown on the home screen. [CHAR_LIMIT=90]">Explore a world of amazing on-device models from</string>
   <string name="app_name" translatable="false">Crew Gallery</string>
-  <string name="app_name_first_part" translatable="false">Google AI</string>
-  <string name="app_name_second_part" translatable="false">Edge Gallery</string>
+  <string name="app_name_first_part" translatable="false">Crew</string>
+  <string name="app_name_second_part" translatable="false">Gallery</string>
   <string name="askimage_emptystate_title" translatable="false">Ask Image</string>
   <string name="askimage_emptystate_content" translatable="true" description="Instructions shown when starting a chat with image input, explaining how to add images (up to 10). [CHAR_LIMIT=203]">To get started, tap the + below to add an image (max 10 images per chat) and type a prompt to ask a question about it!</string>
   <string name="askimage_emptystate_content_aicore" translatable="true" description="Instructions shown when starting a chat with image input for AICore models, explaining how to add a single image. [CHAR_LIMIT=200]">To get started, tap the + below to add an image (max 1 image per chat) and type a prompt to ask a question about it!</string>
@@ -206,7 +206,7 @@
   <string name="test" translatable="true" description="Button label or header for testing functionality. [CHAR_LIMIT=18]">Test</string>
   <string name="text_image_generation_text_field_placeholder" translatable="true" description="Placeholder hint in a text field for generating images from text prompts. [CHAR_LIMIT=30]">Type prompt…</string>
   <string name="text_input_placeholder_llm_chat" translatable="true" description="Placeholder hint in the chat message input field (e.g., 'Type prompt...'). [CHAR_LIMIT=30]">Type prompt…</string>
-  <string name="tos_dialog_title_app" translatable="true" description="Title of the onboarding Terms of Service dialog. [CHAR_LIMIT=45]">Welcome to Google AI Edge Gallery</string>
+  <string name="tos_dialog_title_app" translatable="true" description="Title of the onboarding Terms of Service dialog. [CHAR_LIMIT=45]">Welcome to Crew Gallery</string>
   <!-- Body text of the Terms of Service dialog. Contains links to Google Terms of Service and Privacy Policy. -->
   <string name="tos_dialog_body" translatable="true" description="Main legal and privacy text inside the Terms of Service dialog, including links to Google policies. [CHAR_LIMIT=997]">By using this app, you agree to the [Google Terms of Service](https://policies.google.com/terms?hl=en-US).\n\nThis app collects aggregated usage metrics to understand user engagement, such as error messages, app actions, IP inferred approximate location, OS version. This data is processed in accordance with the [Google Privacy Policy](https://policies.google.com/privacy?hl=en-US).\n\nYour use of each model is subject to the applicable model license terms.</string>
   <!-- Title of the Gemma Terms of Use dialog. -->

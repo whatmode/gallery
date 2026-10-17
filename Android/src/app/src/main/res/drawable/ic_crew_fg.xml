@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Crew Gallery: four agents around a 2x2 gallery of tiles. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:strokeColor="#FF8FB4FF"
+        android:strokeWidth="2.5"
+        android:fillColor="#00000000"
+        android:pathData="M54,35 L54,41 M54,67 L54,73 M35,54 L41,54 M67,54 L73,54" />
+    <path android:fillColor="#FF5FD3A8" android:pathData="M43,41 h9 v9 h-9 z" />
+    <path android:fillColor="#FF7FB2FF" android:pathData="M56,41 h9 v9 h-9 z" />
+    <path android:fillColor="#FFC9A7FF" android:pathData="M43,54 h9 v9 h-9 z" />
+    <path android:fillColor="#FFF2C14E" android:pathData="M56,54 h9 v9 h-9 z" />
+    <path android:fillColor="#FFF2C14E" android:pathData="M54,30 m-5,0 a5,5 0 1,0 10,0 a5,5 0 1,0 -10,0" />
+    <path android:fillColor="#FF7FB2FF" android:pathData="M54,78 m-5,0 a5,5 0 1,0 10,0 a5,5 0 1,0 -10,0" />
+    <path android:fillColor="#FFFF8A80" android:pathData="M30,54 m-5,0 a5,5 0 1,0 10,0 a5,5 0 1,0 -10,0" />
+    <path android:fillColor="#FFC9A7FF" android:pathData="M78,54 m-5,0 a5,5 0 1,0 10,0 a5,5 0 1,0 -10,0" />
+</vector>
