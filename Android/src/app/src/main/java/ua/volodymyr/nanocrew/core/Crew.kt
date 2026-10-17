@@ -1,0 +1,591 @@
+package ua.volodymyr.nanocrew.core
+
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+
+enum class Role(val label: String) {
+    READER("Reader"),
+    ROUTER("Router"),
+    PLANNER("Planner"),
+    WORKER("Worker"),
+    TOOL("Tool"),
+    CRITIC("Critic"),
+    WRITER("Writer"),
+    EDITOR("Editor"),
+}
+
+enum class StepStatus { RUNNING, DONE, ERROR }
+
+data class Step(
+    val id: Int,
+    val role: Role,
+    val title: String,
+    val text: String = "",
+    val status: StepStatus = StepStatus.RUNNING,
+    val startedAt: Long,
+    val endedAt: Long? = null,
+) {
+    val durationMs: Long? get() = endedAt?.let { it - startedAt }
+
+    /** Approximate output speed (≈4 characters per token), shown in the UI to show off the Tensor G4. */
+    val tokensPerSecond: Double?
+        get() {
+            val d = durationMs ?: return null
+            if (d < 200 || role == Role.TOOL || status != StepStatus.DONE || text.length < 8) return null
+            return (text.length / 4.0) / (d / 1000.0)
+        }
+}
+
+enum class Phase { RUNNING, DONE, FAILED, CANCELLED }
+
+data class RunState(
+    val id: String,
+    val task: String,
+    val steps: List<Step> = emptyList(),
+    val finalAnswer: String = "",
+    val phase: Phase = Phase.RUNNING,
+    val error: String? = null,
+    val startedAt: Long,
+    val endedAt: Long? = null,
+    val modelCalls: Int = 0,
+    val attachments: List<String> = emptyList(),
+    /** File changes made in edit mode (zip archives). */
+    val edits: List<FileEdit> = emptyList(),
+    val archiveId: String? = null,
+    val archiveName: String? = null,
+    /** Where the rebuilt zip was saved on the phone, once built. */
+    val outputPath: String? = null,
+    /** Earlier exchanges when this run is a follow-up (oldest first). */
+    val earlier: List<Turn> = emptyList(),
+    /** What the Reader found in the attached files (reused by follow-ups instead of reading again). */
+    val digest: String = "",
+)
+
+data class CrewConfig(
+    val maxSubtasks: Int = 3,
+    val useCritic: Boolean = true,
+    val useTools: Boolean = true,
+    val autoRoute: Boolean = true,
+    val temperature: Float = 0.3f,
+    val prompts: AgentPrompts = AgentPrompts(),
+    /** Which on-device model the agents run on. */
+    val model: ModelChoice = ModelChoice.NANO,
+)
+
+enum class ModelChoice(val label: String) {
+    NANO("Gemini Nano (Android AICore)"),
+    GEMMA("Gemma 4 E2B (in the app, LiteRT-LM)"),
+}
+
+/**
+ * The multi-agent loop, all on one on-device model:
+ *
+ *   [Reader ─► attached files → notes]
+ *   Router ─► (simple) Worker+tools ─► answer
+ *        └─► (complex) Planner ─► Worker₁…Workerₙ (+tools) ─► Critic ─► Writer ─► answer
+ *
+ * Every agent is the same Gemini Nano with a different role prompt. Calls run one at a time,
+ * because AICore serves one inference at a time per app and enforces a quota.
+ */
+class Crew(
+    private val engine: LlmEngine,
+    private val tools: ToolBox,
+    private val config: CrewConfig,
+    private val clock: () -> Long = { System.currentTimeMillis() },
+) {
+    private val _state = MutableStateFlow(RunState(id = "", task = "", startedAt = 0))
+    val state: StateFlow<RunState> = _state.asStateFlow()
+
+    private var nextStepId = 0
+
+    /** Notes / contents of the attached files, shared with every agent. */
+    private var docs = ""
+
+    suspend fun run(
+        id: String,
+        rawTask: String,
+        attachments: List<Attachment> = emptyList(),
+        earlier: List<Turn> = emptyList(),
+        /** Reader notes from earlier in the conversation, covering the files named in [alreadyRead]. */
+        knownDocs: String = "",
+        alreadyRead: Set<String> = emptySet(),
+    ): RunState {
+        // The new message alone decides how to handle it (simple/complex, read/edit); every agent
+        // that does the work also sees the conversation so far.
+        val ask = clip(rawTask, Budget.TASK_CHARS)
+        val task = FollowUp.compose(earlier, rawTask)
+        DebugLog.d(
+            "crew",
+            "run $id start · ${if (earlier.isEmpty()) "new task" else "follow-up #${earlier.size}"} · ask ${rawTask.length} chars · " +
+                "files: ${attachments.joinToString { "${it.name} (${it.kind}, ${it.text.length} chars${if (it.archive != null) ", zip ${it.archive.allPaths.size} files / ${it.archive.files.size} editable" else ""})" }.ifBlank { "none" }} · " +
+                "known notes ${knownDocs.length} chars for ${alreadyRead.joinToString().ifBlank { "-" }} · " +
+                "subtasks ${config.maxSubtasks}, critic ${config.useCritic}, tools ${config.useTools}, autoRoute ${config.autoRoute}, temp ${config.temperature}" +
+                "\nask: " + DebugLog.peek(rawTask, 300),
+        )
+        nextStepId = 0
+        docs = ""
+        _state.value = RunState(
+            id = id, task = rawTask.trim(), startedAt = clock(),
+            attachments = attachments.map { it.baseName }.distinct(),
+            earlier = earlier,
+        )
+
+        try {
+            val toRead = attachments.filter { it.baseName !in alreadyRead }
+            if (knownDocs.isNotBlank()) {
+                val names = attachments.map { it.baseName }.filter { it in alreadyRead }.distinct()
+                val step = startStep(Role.READER, "Already read · ${names.joinToString(", ").ifBlank { "earlier files" }}")
+                endStep(step, "Using what the Reader found earlier in this conversation — no need to read it again.", StepStatus.DONE)
+            }
+            val fresh = if (toRead.isEmpty()) "" else Reading.digest(toRead, task, config.prompts) { title, req ->
+                call(Role.READER, title, req)
+            }
+            docs = listOf(knownDocs, fresh).filter { it.isNotBlank() }.joinToString("\n\n")
+            _state.update { it.copy(digest = docs) }
+            val archive = attachments.firstNotNullOfOrNull { it.archive }
+            if (archive != null && wantsEdit(ask, archive)) {
+                editArchive(task, archive)
+                return _state.value
+            }
+            val simple = config.autoRoute && route(ask)
+            if (simple) {
+                val answer = work(task, subtask = null, index = 0, total = 1, notes = emptyList(), asFinal = true)
+                finish(answer)
+            } else {
+                val subtasks = plan(task)
+                val notes = mutableListOf<Pair<String, String>>()
+                subtasks.forEachIndexed { i, sub ->
+                    notes += sub to work(task, sub, i, subtasks.size, notes, asFinal = false)
+                }
+                val critique = if (config.useCritic) critique(task, notes) else ""
+                finish(write(task, notes, critique))
+            }
+        } catch (e: CancellationException) {
+            markRunningSteps(StepStatus.ERROR, "Stopped.")
+            _state.update { it.copy(phase = Phase.CANCELLED, endedAt = clock()) }
+            DebugLog.d("crew", "run $id stopped after ${clock() - _state.value.startedAt} ms")
+            throw e
+        } catch (e: Exception) {
+            markRunningSteps(StepStatus.ERROR, e.message ?: "Error")
+            _state.update { it.copy(phase = Phase.FAILED, error = e.message ?: e.toString(), endedAt = clock()) }
+            DebugLog.e("crew", "run $id failed", e)
+        }
+        val s = _state.value
+        DebugLog.d(
+            "crew",
+            "run $id ${s.phase} in ${(s.endedAt ?: clock()) - s.startedAt} ms · ${s.modelCalls} calls · ${s.steps.size} steps" +
+                (if (s.edits.isNotEmpty()) " · edits: " + s.edits.joinToString { "${it.action} ${it.path} ${it.status} ${it.detail}" } else "") +
+                "\nanswer: " + DebugLog.peek(s.finalAnswer, 300),
+        )
+        return s
+    }
+
+    // ---- agents -------------------------------------------------------------------------------
+
+    private suspend fun route(task: String): Boolean {
+        val reply = call(Role.ROUTER, "Choosing a strategy", LlmRequest(
+            system = config.prompts.router,
+            prompt = "Request: $task" +
+                (if (docs.isNotBlank()) "\n(The user attached files; their content is available.)" else "") +
+                "\n\nOne word (SIMPLE or COMPLEX):",
+            temperature = 0f, topK = 1, maxOutputTokens = 4,
+        ), stream = false)
+        val simple = RouteParser.isSimple(reply)
+        retitleLast(if (simple) "Simple request → one agent" else "Complex request → full crew")
+        return simple
+    }
+
+    // ---- edit mode (zip archives) ------------------------------------------------------------
+
+    private suspend fun wantsEdit(task: String, archive: ArchiveInfo): Boolean {
+        val reply = call(Role.ROUTER, "Read or edit?", LlmRequest(
+            system = "You classify requests about a zip archive. Reply with exactly one word: EDIT or READ.\n" +
+                "EDIT = the user wants files changed, fixed, translated, added, created or removed.\n" +
+                "READ = the user only wants information, a summary, an explanation or a review.",
+            prompt = "Request: $task\nArchive: ${archive.name} (${archive.allPaths.size} files)\n\nOne word (EDIT or READ):",
+            temperature = 0f, topK = 1, maxOutputTokens = 4,
+        ), stream = false)
+        val u = reply.uppercase()
+        val edit = when {
+            "EDIT" in u && "READ" !in u -> true
+            "READ" in u && "EDIT" !in u -> false
+            else -> EDIT_WORDS.containsMatchIn(task)
+        }
+        retitleLast(if (edit) "Edit request → Editor will change files" else "Question about the archive → full crew")
+        return edit
+    }
+
+    private suspend fun editArchive(task: String, archive: ArchiveInfo) {
+        _state.update { it.copy(archiveId = archive.id, archiveName = archive.name) }
+        val listing = archive.allPaths.take(150).joinToString("\n") { p ->
+            val t = archive.files[p]
+            if (t != null) "$p (${t.lines().size} lines)" else "$p (binary, can't edit)"
+        }
+        val reply = call(Role.PLANNER, "Planning file changes", LlmRequest(
+            system = config.prompts.editPlanner,
+            prompt = "Task: $task\n" + docsBlock(Budget.DOCS_SHORT_CHARS) +
+                "\nFiles in ${archive.name}:\n${clip(listing, 3_000)}\n\n" +
+                "(Lines look like EDIT path: change, CREATE path: content, or DELETE path: why.)\n" +
+                "At most ${config.maxSubtasks} lines:",
+            temperature = 0.1f, maxOutputTokens = 220,
+        ))
+        var planned = EditParsing.parsePlan(reply, archive, config.maxSubtasks)
+        DebugLog.d("crew", "edit plan: ${planned.size} usable of reply:\n" + reply.trim().take(600) +
+            "\nusable: " + planned.joinToString { "${it.action} ${it.path}" }.ifBlank { "none" } +
+            (if (planned.isEmpty()) "\nwhy: " + reply.lines().filter { it.isNotBlank() }.take(5).joinToString(" | ") { l ->
+                val p = Regex("""\b(EDIT|CREATE|DELETE|REMOVE|ADD|FIX|UPDATE|CHANGE)\s+`?([^\s`:]+)""", RegexOption.IGNORE_CASE).find(l)?.groupValues?.get(2)
+                when {
+                    p == null -> "not a plan line"
+                    p in archive.files -> "$p ok"
+                    p in archive.allPaths -> "$p is in the zip but not editable text"
+                    else -> "$p not in the zip"
+                }
+            } else ""))
+        if (planned.isEmpty() && archive.files.size == 1) {
+            planned = listOf(EditParsing.PlannedEdit(FileEdit.Action.EDIT, archive.files.keys.first(), task))
+        }
+        replaceLastText(
+            if (planned.isEmpty()) reply.ifBlank { "(no plan)" }
+            else planned.joinToString("\n") { "${it.action.name} ${it.path}: ${it.instruction}" },
+        )
+        retitleLast("Plan · ${planned.size} file${if (planned.size == 1) "" else "s"}")
+        if (planned.isEmpty()) {
+            finish("I couldn't work out which files to change. Try naming the file, e.g. \"in README.md, fix the install steps\".")
+            return
+        }
+
+        val edits = mutableListOf<FileEdit>()
+        for (p in planned) {
+            val e = when (p.action) {
+                FileEdit.Action.EDIT -> editFile(task, p.path, archive.files.getValue(p.path), p.instruction)
+                FileEdit.Action.CREATE -> createFile(task, p.path, p.instruction)
+                FileEdit.Action.DELETE -> FileEdit(p.path, FileEdit.Action.DELETE, p.instruction, FileEdit.Status.DONE, detail = "removed")
+            }
+            edits += e
+            _state.update { it.copy(edits = edits.toList()) }
+        }
+        finish(editSummary(archive, edits))
+    }
+
+    private suspend fun createFile(task: String, path: String, instruction: String): FileEdit {
+        val reply = call(Role.EDITOR, "Creating $path", LlmRequest(
+            system = config.prompts.editor,
+            prompt = "Task: $task\n" + docsBlock(Budget.DOCS_SHORT_CHARS) +
+                "\nWrite the complete content of the new file `$path`: $instruction\n\nThe file:",
+            temperature = config.temperature, maxOutputTokens = 1_200,
+        ))
+        val content = EditParsing.extractCode(reply)
+        return if (content.isBlank()) FileEdit(path, FileEdit.Action.CREATE, instruction, FileEdit.Status.SKIPPED, detail = "Editor returned nothing")
+        else FileEdit(path, FileEdit.Action.CREATE, instruction, FileEdit.Status.DONE, content = content, detail = "${content.lines().size} lines")
+    }
+
+    /** Small files are rewritten whole; big files are split into chunks and only the relevant ones are rewritten. */
+    private suspend fun editFile(task: String, path: String, original: String, instruction: String): FileEdit {
+        val text = original.replace("\r\n", "\n")
+        val endsWithNewline = text.endsWith("\n")
+        val body = if (endsWithNewline) text.dropLast(1) else text
+        val chunks = Chunker.split(body)
+        val outline = if (chunks.size > 1) EditParsing.outline(body) else ""
+
+        // Which chunks need the change? Keywords first (free), then ask Nano chunk by chunk.
+        val targets: List<Chunk> = if (chunks.size == 1) chunks else locate(path, chunks, instruction)
+        if (targets.isEmpty()) {
+            return FileEdit(path, FileEdit.Action.EDIT, instruction, FileEdit.Status.SKIPPED, detail = "no part of the file matched the change")
+        }
+        val toRewrite = targets.take(MAX_REWRITE_CHUNKS)
+        val newTexts = chunks.map { it.text }.toMutableList()
+        var changed = 0
+        var rejected = 0
+        for (c in toRewrite) {
+            val part = if (chunks.size == 1) "" else " · part ${c.index + 1}/${chunks.size} (lines ${c.startLine + 1}–${c.endLine})"
+            val prompt = buildString {
+                append("Task: ").append(task).append('\n')
+                append("Change to make in `").append(path).append("`: ").append(instruction).append("\n\n")
+                if (chunks.size > 1) {
+                    append("The file is long, so you only see part ${c.index + 1} of ${chunks.size} ")
+                    append("(lines ${c.startLine + 1}–${c.endLine}). Outline of the whole file:\n").append(outline).append("\n\n")
+                    append("Rewrite ONLY this part. If nothing in it needs to change, return it unchanged.\n\n")
+                }
+                append("```\n").append(c.text).append("\n```\n\nThe complete updated ")
+                append(if (chunks.size > 1) "part:" else "file:")
+            }
+            val reply = call(Role.EDITOR, "Editing $path$part", LlmRequest(
+                system = config.prompts.editor,
+                prompt = clip(prompt, Budget.PROMPT_CHARS + 1_500),
+                temperature = 0.1f,
+                maxOutputTokens = (c.text.length / 3 + 300).coerceIn(400, 2_000),
+            ))
+            // Keep the chunk's own trailing blank lines so the stitched file lines up exactly.
+            val trailing = c.text.length - c.text.trimEnd('\n').length
+            val updated = EditParsing.extractCode(reply).trimEnd('\n') + "\n".repeat(trailing)
+            when {
+                // A much shorter result usually means Nano ran out of output room — keep the original.
+                c.text.length > 400 && updated.length < c.text.length * 0.5 -> { rejected++; retitleLast("Editing $path$part · looked cut off, kept original") }
+                updated.isBlank() -> rejected++
+                updated != c.text -> { newTexts[c.index] = updated; changed++ }
+            }
+        }
+
+        val skippedParts = targets.size - toRewrite.size
+        if (changed == 0) {
+            return FileEdit(
+                path, FileEdit.Action.EDIT, instruction, FileEdit.Status.SKIPPED,
+                detail = if (rejected > 0) "the edit looked incomplete, so the original was kept" else "no changes were needed",
+            )
+        }
+        val result = Chunker.join(newTexts) + if (endsWithNewline) "\n" else ""
+        val detail = buildString {
+            append(if (chunks.size == 1) "rewritten" else "$changed of ${chunks.size} parts changed")
+            if (rejected > 0) append(", $rejected part${if (rejected > 1) "s" else ""} kept as-is (edit looked cut off)")
+            if (skippedParts > 0) append(", $skippedParts more matching part${if (skippedParts > 1) "s" else ""} not edited (limit $MAX_REWRITE_CHUNKS)")
+        }
+        return FileEdit(path, FileEdit.Action.EDIT, instruction, FileEdit.Status.DONE, content = result, detail = detail)
+    }
+
+    private suspend fun locate(path: String, chunks: List<Chunk>, instruction: String): List<Chunk> {
+        // The most specific keyword (fewest matching parts) usually pinpoints where the change goes.
+        val hits = EditParsing.keywords(instruction)
+            .map { k -> chunks.filter { c -> c.text.contains(k, ignoreCase = true) } }
+            .filter { it.isNotEmpty() }
+            .minByOrNull { it.size }
+            .orEmpty()
+        run {
+            if (hits.isNotEmpty() && hits.size <= MAX_REWRITE_CHUNKS && hits.size < chunks.size) {
+                val step = startStep(Role.EDITOR, "Locating in $path")
+                endStep(step, "Matched by name: parts ${hits.joinToString { (it.index + 1).toString() }} of ${chunks.size}", StepStatus.DONE)
+                return hits
+            }
+        }
+        val found = mutableListOf<Chunk>()
+        for (c in chunks.take(MAX_LOCATE_CHUNKS)) {
+            val reply = call(Role.EDITOR, "Locating in $path · part ${c.index + 1}/${chunks.size}", LlmRequest(
+                system = "You decide whether a part of a file must change. Reply with exactly one word: YES or NO.",
+                prompt = "Change to make: $instruction\n\nPart ${c.index + 1} of ${chunks.size} of `$path` " +
+                    "(lines ${c.startLine + 1}–${c.endLine}):\n```\n${clip(c.text, 5_500)}\n```\n\nMust this part change? YES or NO:",
+                temperature = 0f, topK = 1, maxOutputTokens = 3,
+            ), stream = false)
+            if (reply.trim().uppercase().startsWith("Y")) found += c
+            if (found.size >= MAX_REWRITE_CHUNKS) break
+        }
+        return found
+    }
+
+    private fun editSummary(archive: ArchiveInfo, edits: List<FileEdit>): String = buildString {
+        val done = edits.count { it.status == FileEdit.Status.DONE }
+        if (done > 0) {
+            append("Changed $done file${if (done == 1) "" else "s"} in **${archive.name}**. Save or share the new zip below.\n\n")
+        } else {
+            append("No files were changed in **${archive.name}**.\n\n")
+        }
+        edits.forEach { e ->
+            val icon = when {
+                e.status == FileEdit.Status.SKIPPED -> "⏭"
+                e.action == FileEdit.Action.CREATE -> "➕"
+                e.action == FileEdit.Action.DELETE -> "🗑"
+                else -> "✏️"
+            }
+            append("- $icon `${e.path}` — ${e.instruction}")
+            if (e.detail.isNotBlank()) append(" *(${e.detail})*")
+            append('\n')
+        }
+    }
+
+    private suspend fun plan(task: String): List<String> {
+        val reply = call(Role.PLANNER, "Planning", LlmRequest(
+            system = config.prompts.planner,
+            prompt = "Task: $task\n" + docsBlock(Budget.DOCS_SHORT_CHARS) +
+                "\nWrite at most ${config.maxSubtasks} subtasks as a numbered list:",
+            temperature = 0.2f, maxOutputTokens = 200,
+        ))
+        val subtasks = PlanParser.parse(reply, task, config.maxSubtasks)
+        replaceLastText(subtasks.mapIndexed { i, s -> "${i + 1}. $s" }.joinToString("\n"))
+        retitleLast("Plan · ${subtasks.size} subtask${if (subtasks.size == 1) "" else "s"}")
+        return subtasks
+    }
+
+    private suspend fun work(
+        task: String,
+        subtask: String?,
+        index: Int,
+        total: Int,
+        notes: List<Pair<String, String>>,
+        asFinal: Boolean,
+    ): String {
+        val title = if (subtask == null) "Answering" else "Worker ${index + 1}/$total · ${clip(subtask, 60)}"
+        val system = buildString {
+            append(if (asFinal) config.prompts.chat else config.prompts.worker)
+            if (config.useTools) { append("\n\n"); append(tools.manual()) }
+        }
+        val context = buildString {
+            if (subtask != null) {
+                appendLine("Overall task: $task")
+                if (notes.isNotEmpty()) {
+                    appendLine()
+                    appendLine("What teammates already found:")
+                    appendLine(formatNotes(notes, Budget.ALL_FINDINGS_CHARS / 2))
+                }
+                append(docsBlock(Budget.DOCS_CHARS))
+                appendLine()
+                append("Your subtask: $subtask")
+            } else {
+                append(task)
+                append(docsBlock(Budget.DOCS_CHARS))
+            }
+        }
+
+        var reply = call(
+            Role.WORKER, title,
+            LlmRequest(system, clip(context, Budget.PROMPT_CHARS), config.temperature),
+            mirrorToFinal = asFinal,
+        )
+        if (!config.useTools) return reply
+
+        // Up to two rounds of tool use (ReAct-style, but in a format a small model can follow).
+        val transcript = StringBuilder()
+        repeat(2) { round ->
+            val calls = ToolParser.parse(reply)
+            if (calls.isEmpty()) return reply
+            transcript.appendLine(if (round == 0) "\n\nTool results:" else "")
+            for (c in calls) {
+                val result = runTool(c)
+                transcript.appendLine("${c.name}(${c.argument}) → $result")
+            }
+            val leftover = ToolParser.stripCalls(reply)
+            val followUp = buildString {
+                append(context)
+                if (leftover.isNotBlank()) { append("\n\nYour draft so far: "); append(clip(leftover, 600)) }
+                append(transcript)
+                append("\nNow write your answer using these results. Only write another CALL line if you truly need one more tool.")
+            }
+            reply = call(
+                Role.WORKER, "$title · with tool results",
+                LlmRequest(system, clip(followUp, Budget.PROMPT_CHARS), config.temperature),
+                mirrorToFinal = asFinal,
+            )
+        }
+        return ToolParser.stripCalls(reply).ifBlank { reply }
+    }
+
+    private suspend fun runTool(c: ToolCall): String {
+        val step = startStep(Role.TOOL, "${c.name}${if (c.argument.isNotBlank()) ": ${clip(c.argument, 40)}" else ""}")
+        val result = tools.execute(c)
+        endStep(step, result, if (result.startsWith("error")) StepStatus.ERROR else StepStatus.DONE)
+        return result
+    }
+
+    private suspend fun critique(task: String, notes: List<Pair<String, String>>): String {
+        val reply = call(Role.CRITIC, "Reviewing", LlmRequest(
+            system = config.prompts.critic,
+            prompt = "Task: $task\n" + docsBlock(Budget.DOCS_SHORT_CHARS) + "\nTeam notes:\n${formatNotes(notes, Budget.ALL_FINDINGS_CHARS)}\n\nProblems (or LOOKS GOOD):",
+            temperature = 0.1f, maxOutputTokens = 160,
+        ))
+        val ok = CriticParser.approves(reply)
+        retitleLast(if (ok) "Review · looks good" else "Review · found issues")
+        return if (ok) "" else reply
+    }
+
+    private suspend fun write(task: String, notes: List<Pair<String, String>>, critique: String): String {
+        val prompt = buildString {
+            appendLine("Task: $task")
+            appendLine()
+            append(docsBlock(Budget.DOCS_SHORT_CHARS))
+            appendLine()
+            appendLine("Team notes:")
+            appendLine(formatNotes(notes, Budget.ALL_FINDINGS_CHARS))
+            if (critique.isNotBlank()) {
+                appendLine()
+                appendLine("Critic's problems to fix:")
+                appendLine(clip(critique, 700))
+            }
+            appendLine()
+            append("Final answer:")
+        }
+        return call(Role.WRITER, "Writing the answer", LlmRequest(
+            config.prompts.writer, clip(prompt, Budget.PROMPT_CHARS), config.temperature, maxOutputTokens = 640,
+        ), mirrorToFinal = true)
+    }
+
+    private fun docsBlock(max: Int): String =
+        if (docs.isBlank()) "" else "\nAttached files (from the user):\n${clip(docs, max)}\n"
+
+    private fun formatNotes(notes: List<Pair<String, String>>, budget: Int): String {
+        if (notes.isEmpty()) return "(none yet)"
+        val each = (budget / notes.size).coerceIn(200, Budget.FINDING_CHARS)
+        return notes.mapIndexed { i, (sub, found) -> "[${i + 1}] $sub\n${clip(found, each)}" }.joinToString("\n\n")
+    }
+
+    // ---- step bookkeeping ---------------------------------------------------------------------
+
+    private suspend fun call(
+        role: Role,
+        title: String,
+        request: LlmRequest,
+        stream: Boolean = true,
+        mirrorToFinal: Boolean = false,
+    ): String {
+        val step = startStep(role, title)
+        _state.update { it.copy(modelCalls = it.modelCalls + 1) }
+        DebugLog.d("crew", "step ${step.id} ${role.name} \"$title\" → model call (prompt ${request.prompt.length} chars)")
+        val sb = StringBuilder()
+        val out = engine.generate(request) { chunk ->
+            if (!stream) return@generate
+            if (chunk == LlmEngine.RESTART) sb.setLength(0) else sb.append(chunk)
+            val text = sb.toString()
+            _state.update { s ->
+                s.copy(
+                    steps = s.steps.map { if (it.id == step.id) it.copy(text = text) else it },
+                    finalAnswer = if (mirrorToFinal) text else s.finalAnswer,
+                )
+            }
+        }.trim()
+        endStep(step, out, StepStatus.DONE)
+        DebugLog.d("crew", "step ${step.id} ${role.name} done in ${clock() - step.startedAt} ms · ${out.length} chars")
+        return out
+    }
+
+    private companion object {
+        const val MAX_REWRITE_CHUNKS = 8
+        const val MAX_LOCATE_CHUNKS = 20
+        val EDIT_WORDS = Regex(
+            "\\b(fix|edit|change|modify|update|rewrite|refactor|rename|translate|add|create|remove|delete|replace|comment|format|correct)\\b",
+            RegexOption.IGNORE_CASE,
+        )
+    }
+
+    private fun startStep(role: Role, title: String): Step {
+        val step = Step(id = nextStepId++, role = role, title = title, startedAt = clock())
+        _state.update { it.copy(steps = it.steps + step) }
+        return step
+    }
+
+    private fun endStep(step: Step, text: String, status: StepStatus) {
+        val now = clock()
+        _state.update { s ->
+            s.copy(steps = s.steps.map { if (it.id == step.id) it.copy(text = text, status = status, endedAt = now) else it })
+        }
+    }
+
+    private fun retitleLast(title: String) = _state.update { s ->
+        s.copy(steps = s.steps.dropLast(1) + listOfNotNull(s.steps.lastOrNull()?.copy(title = title)))
+    }
+
+    private fun replaceLastText(text: String) = _state.update { s ->
+        s.copy(steps = s.steps.dropLast(1) + listOfNotNull(s.steps.lastOrNull()?.copy(text = text)))
+    }
+
+    private fun markRunningSteps(status: StepStatus, note: String) {
+        val now = clock()
+        _state.update { s ->
+            s.copy(steps = s.steps.map {
+                if (it.status == StepStatus.RUNNING) it.copy(status = status, endedAt = now, text = it.text.ifBlank { note }) else it
+            })
+        }
+    }
+
+    private fun finish(answer: String) {
+        _state.update { it.copy(finalAnswer = answer.trim(), phase = Phase.DONE, endedAt = clock()) }
+    }
+}

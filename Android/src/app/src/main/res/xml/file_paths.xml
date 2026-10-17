@@ -16,6 +16,7 @@
 -->
 
 <paths>
+    <files-path name="crew_outputs" path="crew/outputs/" />
     <cache-path
         name="cache_pictures"
         path="images/" />
