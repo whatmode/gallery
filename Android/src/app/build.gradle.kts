@@ -33,11 +33,11 @@ android {
   compileSdk { this.version = release(37) { minorApiLevel = 0 } }
 
   defaultConfig {
-    applicationId = "com.google.aiedge.gallery"
+    applicationId = "ua.volodymyr.crewgallery"
     minSdk = 31
     targetSdk = 37
     versionCode = 46
-    versionName = "1.0.20"
+    versionName = "1.0.20-crew.1"
 
     // Needed for HuggingFace auth workflows.
     // Use the scheme of the "Redirect URLs" in HuggingFace app.
@@ -51,11 +51,21 @@ android {
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
 
+  // One fixed key (kept in the repo, like Nano Crew's) so every build installs over the last one.
+  signingConfigs {
+    create("crew") {
+      storeFile = file("crew.keystore")
+      storePassword = "nanocrew"
+      keyAlias = "nanocrew"
+      keyPassword = "nanocrew"
+    }
+  }
+
   buildTypes {
     release {
       isMinifyEnabled = false
       proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-      signingConfig = signingConfigs.getByName("debug")
+      signingConfig = signingConfigs.getByName("crew")
     }
   }
   compileOptions {
