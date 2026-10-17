@@ -454,7 +454,7 @@ fun shareFile(context: android.content.Context, file: java.io.File) {
         putExtra(android.content.Intent.EXTRA_STREAM, uri)
         addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
     }
-    context.startActivity(android.content.Intent.createChooser(send, file.name))
+    startChooser(context, android.content.Intent.createChooser(send, file.name))
 }
 
 fun shareText(context: android.content.Context, text: String) {
@@ -462,5 +462,25 @@ fun shareText(context: android.content.Context, text: String) {
         type = "text/plain"
         putExtra(android.content.Intent.EXTRA_TEXT, text)
     }
-    context.startActivity(android.content.Intent.createChooser(send, null))
+    startChooser(context, android.content.Intent.createChooser(send, null))
+}
+
+/** Opens the share sheet from any context (Gallery's screens may hand us a wrapped one). */
+fun startChooser(context: android.content.Context, chooser: android.content.Intent) {
+    try {
+        if (context.findActivity() == null) chooser.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+        (context.findActivity() ?: context).startActivity(chooser)
+    } catch (e: Exception) {
+        ua.volodymyr.nanocrew.core.DebugLog.e("share", "couldn't open the share sheet", e)
+        android.widget.Toast.makeText(context, "Couldn't share: ${e.message}", android.widget.Toast.LENGTH_LONG).show()
+    }
+}
+
+private fun android.content.Context.findActivity(): android.app.Activity? {
+    var c: android.content.Context? = this
+    while (c is android.content.ContextWrapper) {
+        if (c is android.app.Activity) return c
+        c = c.baseContext
+    }
+    return null
 }

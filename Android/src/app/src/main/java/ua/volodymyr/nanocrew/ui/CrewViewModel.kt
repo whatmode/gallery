@@ -34,7 +34,10 @@ import java.util.UUID
  */
 class CrewViewModel(app: Application) : AndroidViewModel(app) {
 
-    init { DebugLog.init(java.io.File(app.filesDir, "crew/logs")) }
+    init {
+        DebugLog.init(java.io.File(app.filesDir, "crew/logs"))
+        installCrashLog()
+    }
 
     private val storage = Storage(app)
     private val files = FileImport(app)
@@ -239,6 +242,7 @@ class CrewViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Writes the whole log to one text file and opens the share sheet (send it to Claude to fix things). */
     fun shareDebugLog(context: android.content.Context) = viewModelScope.launch {
+      try {
         val file = withContext(kotlinx.coroutines.Dispatchers.IO) {
             val stamp = java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US).format(java.util.Date())
             val out = storage.outputFile("debug", "crewgallery-debug-$stamp.txt")
@@ -261,7 +265,11 @@ class CrewViewModel(app: Application) : AndroidViewModel(app) {
             putExtra(android.content.Intent.EXTRA_SUBJECT, file.name)
             addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
-        context.startActivity(android.content.Intent.createChooser(send, "Share debug log"))
+        startChooser(context, android.content.Intent.createChooser(send, "Share debug log"))
+      } catch (e: Exception) {
+        DebugLog.e("share", "couldn't share the debug log", e)
+        android.widget.Toast.makeText(context, "Couldn't share the log: ${e.message}", android.widget.Toast.LENGTH_LONG).show()
+      }
     }
 
     fun clearDebugLog() = DebugLog.clear()
@@ -404,6 +412,22 @@ class CrewViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private companion object {
+        @Volatile private var crashLogInstalled = false
+
+        /** Writes any crash to the crew's debug log before the app closes (then Android's handler runs). */
+        fun installCrashLog() {
+            if (crashLogInstalled) return
+            crashLogInstalled = true
+            val previous = Thread.getDefaultUncaughtExceptionHandler()
+            Thread.setDefaultUncaughtExceptionHandler { t, e ->
+                runCatching {
+                    DebugLog.e("crash", "uncaught on ${t.name}", e)
+                    DebugLog.file?.appendText("CRASH ${e.stackTraceToString().take(4000)}\n")
+                }
+                previous?.uncaughtException(t, e)
+            }
+        }
+
         const val MAX_FILES = 5
         /** A follow-up that only asks to take the last change back. */
         val UNDO = Regex("""^\s*(please\s+)?(undo|revert|roll\s*back|take\s+(it|that)\s+back|cancel\s+(that|the\s+last|those)\s*(change|changes|edit|edits)?)\b""", RegexOption.IGNORE_CASE)

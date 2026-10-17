@@ -36,8 +36,8 @@ android {
     applicationId = "ua.volodymyr.crewgallery"
     minSdk = 31
     targetSdk = 37
-    versionCode = 48
-    versionName = "1.0.20-crew.3"
+    versionCode = 49
+    versionName = "1.0.20-crew.4"
 
     // Needed for HuggingFace auth workflows.
     // Use the scheme of the "Redirect URLs" in HuggingFace app.
@@ -108,6 +108,8 @@ dependencies {
   implementation(libs.litertlm)
   // Nano Crew: PDF text extraction, fully on-device
   implementation("com.tom-roush:pdfbox-android:2.0.27.0")
+  // Nano Crew: rebuild zips keeping symlinks and permissions
+  implementation("org.apache.commons:commons-compress:1.27.1")
   implementation(libs.commonmark)
   implementation(libs.richtext)
   implementation(libs.tflite)

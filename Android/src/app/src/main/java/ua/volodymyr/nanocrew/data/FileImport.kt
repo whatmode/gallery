@@ -162,6 +162,14 @@ class FileImport(context: Context) {
             throw ImportException("Couldn't copy $name: ${e.message ?: e::class.java.simpleName}")
         }
 
+        // Symlinks (e.g. systemd "wants" links) look like tiny text files; never read or edit them.
+        val links = try {
+            @Suppress("DEPRECATION")
+            org.apache.commons.compress.archivers.zip.ZipFile(copy).use { zf ->
+                zf.entries.toList().filter { it.isUnixSymlink }.map { it.name.replace('\\', '/').trimStart('/') }.toSet()
+            }
+        } catch (e: Exception) { emptySet() }
+
         try {
             copy.inputStream().use { raw ->
                 ZipInputStream(java.io.BufferedInputStream(raw)).use { zip ->
@@ -171,6 +179,7 @@ class FileImport(context: Context) {
                         if (e.isDirectory) continue
                         val path = e.name.replace('\\', '/').trimStart('/')
                         if (isJunk(path)) { skippedJunk++; continue }
+                        if (path in links) { tree += "$path (symlink)"; continue }
                         tree += path
                         val ext = path.substringAfterLast('/').substringAfterLast('.', "").lowercase()
                         val wanted = ext in TEXT_EXT || ext in IMAGE_EXT || ext == "pdf" || ext == "docx" ||

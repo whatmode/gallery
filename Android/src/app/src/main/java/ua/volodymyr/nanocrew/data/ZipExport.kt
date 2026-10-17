@@ -2,17 +2,20 @@ package ua.volodymyr.nanocrew.data
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import org.apache.commons.compress.archivers.zip.ZipArchiveEntry
+import org.apache.commons.compress.archivers.zip.ZipArchiveOutputStream
+import org.apache.commons.compress.archivers.zip.ZipFile
 import ua.volodymyr.nanocrew.core.FileEdit
 import java.io.File
-import java.util.zip.ZipEntry
-import java.util.zip.ZipInputStream
-import java.util.zip.ZipOutputStream
 
 /**
- * Rebuilds a zip with the Editor's changes: every untouched entry is copied as-is (including
- * binaries and the folders the Reader skipped), edited files are replaced, new files are added.
+ * Rebuilds a zip with the Editor's changes. Untouched entries are copied raw, byte for byte, so
+ * symlinks, executable bits and timestamps stay exactly as they were; edited files keep their
+ * original permissions; new files are added as ordinary 644 files.
  */
 object ZipExport {
+
+    private const val REGULAR_644 = 0x81A4 // S_IFREG | 0644
 
     suspend fun build(original: File, out: File, edits: List<FileEdit>): File = withContext(Dispatchers.IO) {
         val done = edits.filter { it.status == FileEdit.Status.DONE }
@@ -21,34 +24,35 @@ object ZipExport {
         val written = mutableSetOf<String>()
         out.parentFile?.mkdirs()
 
-        ZipInputStream(original.inputStream().buffered()).use { zin ->
-            ZipOutputStream(out.outputStream().buffered()).use { zout ->
-                while (true) {
-                    val e = zin.nextEntry ?: break
+        @Suppress("DEPRECATION")
+        ZipFile(original).use { zf ->
+            ZipArchiveOutputStream(out).use { zout ->
+                for (e in zf.entries.toList()) {
                     val path = e.name.replace('\\', '/').trimStart('/')
                     if (path in deleted) continue
                     if (!written.add(path)) continue // duplicate entries would make an invalid zip
-                    val entry = ZipEntry(e.name).apply { if (e.time > 0) time = e.time }
-                    zout.putNextEntry(entry)
                     val edit = byPath[path]
-                    if (!e.isDirectory) {
-                        if (edit != null) {
-                            val oldBytes = zin.readBytes()
-                            zout.write(encode(edit.content, crlf = String(oldBytes, Charsets.UTF_8).contains("\r\n")))
-                        } else {
-                            zin.copyTo(zout)
-                        }
+                    if (edit == null || e.isDirectory || e.isUnixSymlink) {
+                        zf.getRawInputStream(e).use { zout.addRawArchiveEntry(e, it) }
+                        continue
                     }
-                    zout.closeEntry()
+                    val oldBytes = zf.getInputStream(e).use { it.readBytes() }
+                    val entry = ZipArchiveEntry(e.name).apply {
+                        if (e.unixMode != 0) unixMode = e.unixMode
+                        if (e.time > 0) time = e.time
+                    }
+                    zout.putArchiveEntry(entry)
+                    zout.write(encode(edit.content, crlf = String(oldBytes, Charsets.UTF_8).contains("\r\n")))
+                    zout.closeArchiveEntry()
                 }
                 // New files the Editor created.
                 for (edit in done) {
                     if (edit.action == FileEdit.Action.DELETE) continue
                     val path = edit.path.trimStart('/')
                     if (path in written || path.contains("..")) continue
-                    zout.putNextEntry(ZipEntry(path))
+                    zout.putArchiveEntry(ZipArchiveEntry(path).apply { unixMode = REGULAR_644 })
                     zout.write(encode(edit.content, crlf = false))
-                    zout.closeEntry()
+                    zout.closeArchiveEntry()
                     written += path
                 }
             }
