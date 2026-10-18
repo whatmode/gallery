@@ -46,6 +46,8 @@ fun SettingsScreen(
     debugBytes: Long = 0,
     onShareDebug: () -> Unit = {},
     onClearDebug: () -> Unit = {},
+    memoryText: String = "",
+    onFreeMemory: (() -> Unit)? = null,
 ) {
     Column(
         modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
@@ -68,6 +70,20 @@ fun SettingsScreen(
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         TextButton(onClick = onCheckModel) { Text("Re-check model") }
+
+        if (onFreeMemory != null) {
+            HorizontalDivider(Modifier.padding(vertical = 8.dp))
+            SectionLabel("Phone memory")
+            Text(memoryText, style = MaterialTheme.typography.bodyMedium)
+            Text(
+                "Free memory unloads every other model this app has loaded (Chat, Agent Skills…) and " +
+                    "releases what it can. Android doesn't let one app close others: to free more, swipe " +
+                    "away apps in Recents.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            OutlinedButton(onClick = onFreeMemory) { Text("Free memory") }
+        }
 
         HorizontalDivider(Modifier.padding(vertical = 8.dp))
         SectionLabel("Crew")

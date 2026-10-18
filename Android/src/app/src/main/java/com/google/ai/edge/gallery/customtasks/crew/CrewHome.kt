@@ -27,6 +27,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.google.ai.edge.gallery.ui.modelmanager.ModelManagerViewModel
+import kotlinx.coroutines.launch
 import ua.volodymyr.nanocrew.core.Phase
 import ua.volodymyr.nanocrew.ui.CrewScreen
 import ua.volodymyr.nanocrew.ui.CrewViewModel
@@ -63,6 +64,9 @@ fun CrewHome(modelManagerViewModel: ModelManagerViewModel, bottomPadding: Dp) {
   val waiting by vm.engine.waiting.collectAsStateWithLifecycle()
   val debugLines by vm.debugLines.collectAsStateWithLifecycle()
   val context = LocalContext.current
+  val scope = androidx.compose.runtime.rememberCoroutineScope()
+  var memoryText by remember { androidx.compose.runtime.mutableStateOf(memoryLine(context)) }
+  LaunchedEffect(tab) { if (tab == 2) memoryText = memoryLine(context) }
 
   // Keep the screen on while the agents work.
   val working = run?.phase == Phase.RUNNING
@@ -151,7 +155,46 @@ fun CrewHome(modelManagerViewModel: ModelManagerViewModel, bottomPadding: Dp) {
           debugBytes = remember(debugLines.size) { vm.debugLogSize },
           onShareDebug = { vm.shareDebugLog(context) },
           onClearDebug = { vm.clearDebugLog() },
+          memoryText = memoryText,
+          onFreeMemory = {
+            val before = freeMb(context)
+            var unloaded = 0
+            for (t in mmState.tasks) {
+              for (m in t.models) {
+                if (m.instance != null && m.name != model.name) {
+                  unloaded++
+                  modelManagerViewModel.cleanupModel(context = context, task = t, model = m)
+                }
+              }
+            }
+            System.gc()
+            Runtime.getRuntime().gc()
+            scope.launch {
+              kotlinx.coroutines.delay(1500)
+              val after = freeMb(context)
+              memoryText = memoryLine(context)
+              ua.volodymyr.nanocrew.core.DebugLog.d("memory", "free memory: unloaded $unloaded models · $before → $after MB free")
+              android.widget.Toast.makeText(
+                context,
+                "Unloaded $unloaded other model${if (unloaded == 1) "" else "s"} · free ${before} → ${after} MB",
+                android.widget.Toast.LENGTH_LONG,
+              ).show()
+            }
+          },
         )
     }
   }
+}
+
+private fun memInfo(context: android.content.Context): android.app.ActivityManager.MemoryInfo =
+  android.app.ActivityManager.MemoryInfo().also {
+    context.getSystemService(android.app.ActivityManager::class.java).getMemoryInfo(it)
+  }
+
+private fun freeMb(context: android.content.Context) = memInfo(context).availMem / 1_048_576
+
+private fun memoryLine(context: android.content.Context): String {
+  val mi = memInfo(context)
+  val gb = { b: Long -> "%.1f".format(b / 1_073_741_824.0) }
+  return "${gb(mi.availMem)} GB free of ${gb(mi.totalMem)} GB" + if (mi.lowMemory) " · low!" else ""
 }
