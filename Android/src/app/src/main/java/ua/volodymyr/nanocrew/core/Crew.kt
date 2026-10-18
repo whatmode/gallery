@@ -391,7 +391,7 @@ class Crew(
             val name = path.substringAfterLast('/')
             val agent = "Agent ${n + 1} · $name"
             val context = task + if (notes.isEmpty()) "" else "\n\nWhat the agents on other files found:\n" + notes.joinToString("\n") { "- $it" }
-            val what = mutableListOf<String>()
+            val what = linkedMapOf<Int, String>()
             for (c in parts) {
                 if (calls >= TRIAGE_CALLS) break
                 calls++
@@ -407,14 +407,15 @@ class Crew(
                 ))
                 val change = parseTriage(reply)
                 retitleLast("$agent · checked$where · " + if (change == null) "no change here" else "needs a change")
-                if (change != null) what += change
+                if (change != null) what[c.index] = change
             }
             if (what.isEmpty()) {
                 notes += "$name: nothing to change"
                 continue
             }
-            val instruction = clip(what.distinct().joinToString("; "), 400)
-            val e = editFile(context, path, archive.files.getValue(path), instruction)
+            val instruction = clip(what.values.distinct().joinToString("; "), 400)
+            // Edit only the parts this agent flagged, each with what it found there.
+            val e = editFile(context, path, archive.files.getValue(path), instruction, parts = what, label = "$agent · editing")
             edits += e
             notes += "$name: " + (if (e.status == FileEdit.Status.DONE) "changed — $instruction" else "wanted to: $instruction (not applied: ${e.detail.take(80)})")
             _state.update { it.copy(edits = edits.toList()) }
@@ -452,7 +453,14 @@ class Crew(
      * and what replaces them ([Patching]). Lines it can't find exactly are rejected, and an edit that
      * changes far more than asked is dropped, so a small model can't quietly damage the file.
      */
-    private suspend fun editFile(task: String, path: String, original: String, instruction: String): FileEdit {
+    /**
+     * [parts]: when an agent already checked the file part by part, the parts to change (by chunk
+     * index) with what to do in each; only those parts are edited, each with its own instruction.
+     */
+    private suspend fun editFile(
+        task: String, path: String, original: String, instruction: String,
+        parts: Map<Int, String>? = null, label: String = "Editing $path",
+    ): FileEdit {
         val text = original.replace("\r\n", "\n")
         // "Add #include <X>" / "import a.b.C": the app does it itself — an addition, never a swap.
         EditGuard.includeShortcut(path, text, instruction)?.let { s ->
@@ -465,7 +473,11 @@ class Crew(
         val outline = if (chunks.size > 1) EditParsing.outline(text) else ""
 
         // Which parts need the change? Keywords first (free), then ask the model part by part.
-        val targets: List<Chunk> = if (chunks.size == 1) chunks else locate(path, chunks, instruction)
+        val targets: List<Chunk> = when {
+            parts != null -> chunks.filter { it.index in parts.keys }
+            chunks.size == 1 -> chunks
+            else -> locate(path, chunks, instruction)
+        }
         if (targets.isEmpty()) {
             return FileEdit(path, FileEdit.Action.EDIT, instruction, FileEdit.Status.SKIPPED, detail = "no part of the file matched the change")
         }
@@ -477,10 +489,11 @@ class Crew(
         /** What the Editor proposed and why it was turned down, kept for the answer and follow-ups. */
         val rejected = StringBuilder()
         for (c in targets.take(MAX_REWRITE_CHUNKS)) {
+            val partInstruction = parts?.get(c.index) ?: instruction
             val part = if (chunks.size == 1) "" else " · part ${c.index + 1}/${chunks.size} (lines ${c.startLine + 1}–${c.endLine})"
             val prompt = buildString {
                 append("Task: ").append(task).append('\n')
-                append("Change to make in `").append(path).append("`: ").append(instruction).append("\n\n")
+                append("Change to make in `").append(path).append("`: ").append(partInstruction).append("\n\n")
                 if (chunks.size > 1) {
                     append("Outline of the whole file:\n").append(outline).append("\n\n")
                     append("Part ${c.index + 1} of ${chunks.size} (lines ${c.startLine + 1}–${c.endLine}):\n")
@@ -488,7 +501,7 @@ class Crew(
                 append("```\n").append(c.text).append("\n```\n\n")
                 append("Write only the change blocks (or NONE if this part needs no change):")
             }
-            val reply = call(Role.EDITOR, "Editing $path$part", LlmRequest(
+            val reply = call(Role.EDITOR, "$label$part", LlmRequest(
                 system = PATCH_EDITOR,
                 prompt = clip(prompt, Budget.PROMPT_CHARS + 1_500),
                 temperature = 0.1f,
@@ -498,8 +511,8 @@ class Crew(
             if (blocks.isEmpty()) {
                 if (reply.trim().trim('`').trim().uppercase().startsWith("NONE") || reply.isBlank()) continue
                 // Wrote code, but not as change blocks: show the format once more.
-                retitleLast("Editing $path$part · not in change-block format, retrying")
-                val again = call(Role.EDITOR, "Editing $path$part · retry (format)", LlmRequest(
+                retitleLast("$label$part · not in change-block format, retrying")
+                val again = call(Role.EDITOR, "$label$part · retry (format)", LlmRequest(
                     system = PATCH_EDITOR,
                     prompt = clip(prompt, Budget.PROMPT_CHARS) +
                         "\n\nYour previous answer was code, not change blocks, so it could not be applied:\n" + clip(reply, 800) +
@@ -517,22 +530,22 @@ class Crew(
                 }
             }
             val guard: (Patching.Block) -> String? = { b ->
-                EditGuard.checkBlock(path, b.find, b.replace, instruction)
+                EditGuard.checkBlock(path, b.find, b.replace, partInstruction)
                     ?: currentArchive?.let { a -> EditGuard.checkCalls(b.find, b.replace, a.files) }
             }
             var r = Patching.apply(current, blocks, check = guard)
             // Everything rejected: tell the Editor why and let it try once more.
             if (r.applied == 0 && r.failed.isNotEmpty()) {
                 rejected.append(Patching.describeRejected(blocks, r.failed))
-                retitleLast("Editing $path$part · rejected (${r.failed.first().substringAfter(": ")}), retrying")
-                val retry = call(Role.EDITOR, "Editing $path$part · retry", LlmRequest(
+                retitleLast("$label$part · rejected (${r.failed.first().substringAfter(": ")}), retrying")
+                val retry = call(Role.EDITOR, "$label$part · retry", LlmRequest(
                     system = PATCH_EDITOR,
                     prompt = clip(prompt, Budget.PROMPT_CHARS) +
                         "\n\nYour previous answer was rejected:\n" + r.failed.joinToString("\n") { "- $it" } +
                         "\nYou wrote:\n" + clip(reply, 1_000) +
                         "\n\nFix it. " + (if (r.failed.any { "same as FIND" in it })
                             "Keep FIND exactly as it is. In REPLACE write the NEW version of those lines that does this: " +
-                                instruction + ". REPLACE must contain new or changed code. "
+                                partInstruction + ". REPLACE must contain new or changed code. "
                         else "REPLACE must be different from FIND and keep every FIND line that should stay. ") +
                         "Write only the corrected change blocks:",
                     temperature = 0.5f,
@@ -555,7 +568,7 @@ class Crew(
                 if (diff.isNotEmpty()) diff.append('\n')
                 diff.append(r.diff)
             }
-            retitleLast("Editing $path$part · ${r.applied} of ${blocks.size} change${if (blocks.size == 1) "" else "s"} fit" +
+            retitleLast("$label$part · ${r.applied} of ${blocks.size} change${if (blocks.size == 1) "" else "s"} fit" +
                 if (r.failed.isNotEmpty()) " (${r.failed.size} rejected)" else "")
         }
         DebugLog.d("crew", "edit $path: applied $applied, $changedLines lines changed, rejected ${failed.size}: ${failed.joinToString(" | ")}")
