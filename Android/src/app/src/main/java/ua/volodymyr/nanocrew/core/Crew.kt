@@ -374,6 +374,8 @@ class Crew(
         var changedLines = 0
         val failed = mutableListOf<String>()
         val diff = StringBuilder()
+        /** What the Editor proposed and why it was turned down, kept for the answer and follow-ups. */
+        val rejected = StringBuilder()
         for (c in targets.take(MAX_REWRITE_CHUNKS)) {
             val part = if (chunks.size == 1) "" else " · part ${c.index + 1}/${chunks.size} (lines ${c.startLine + 1}–${c.endLine})"
             val prompt = buildString {
@@ -392,9 +394,33 @@ class Crew(
                 temperature = 0.1f,
                 maxOutputTokens = 700,
             ))
-            val blocks = Patching.parse(reply)
+            var blocks = Patching.parse(reply)
             if (blocks.isEmpty()) continue
-            val r = Patching.apply(current, blocks) { b -> EditGuard.checkBlock(path, b.find, b.replace, instruction) }
+            val guard: (Patching.Block) -> String? = { b -> EditGuard.checkBlock(path, b.find, b.replace, instruction) }
+            var r = Patching.apply(current, blocks, check = guard)
+            // Everything rejected: tell the Editor why and let it try once more.
+            if (r.applied == 0 && r.failed.isNotEmpty()) {
+                rejected += Patching.describeRejected(blocks, r.failed)
+                retitleLast("Editing $path$part · rejected (${r.failed.first().substringAfter(": ")}), retrying")
+                val retry = call(Role.EDITOR, "Editing $path$part · retry", LlmRequest(
+                    system = PATCH_EDITOR,
+                    prompt = clip(prompt, Budget.PROMPT_CHARS) +
+                        "\n\nYour previous answer was rejected:\n" + r.failed.joinToString("\n") { "- $it" } +
+                        "\nYou wrote:\n" + clip(reply, 1_000) +
+                        "\n\nFix it. REPLACE must be different from FIND and keep every FIND line that should stay. " +
+                        "Write only the corrected change blocks:",
+                    temperature = 0.2f,
+                    maxOutputTokens = 700,
+                ))
+                val again = Patching.parse(retry)
+                if (again.isNotEmpty()) {
+                    val r2 = Patching.apply(current, again, check = guard)
+                    if (r2.applied > 0) { blocks = again; r = r2 } else {
+                        rejected += Patching.describeRejected(again, r2.failed)
+                        r = r2
+                    }
+                }
+            }
             failed += r.failed
             if (r.applied > 0) {
                 current = r.text
@@ -411,8 +437,9 @@ class Crew(
         if (applied == 0) {
             return FileEdit(
                 path, FileEdit.Action.EDIT, instruction, FileEdit.Status.SKIPPED,
-                detail = if (failed.isNotEmpty()) "the proposed changes were rejected (${failed.first()}), so nothing was changed"
+                detail = if (failed.isNotEmpty()) "rejected, nothing was changed: " + failed.distinct().take(3).joinToString("; ") { it.substringAfter(": ") }
                 else "no changes were needed",
+                diff = rejected.toString().trimEnd(),
             )
         }
         // Damage check: a request touches a few lines; dozens changed means the model went astray.

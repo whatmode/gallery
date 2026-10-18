@@ -65,7 +65,7 @@ object Patching {
             val findLines = b.find.split("\n").dropWhile { it.isBlank() }.dropLastWhile { it.isBlank() }
             if (findLines.isEmpty()) { failed += "change $n: nothing to find"; continue }
             if (findLines.size > maxFindLines) { failed += "change $n: too big (${findLines.size} lines)"; continue }
-            if (b.find.trimEnd() == b.replace.trimEnd()) { failed += "change $n: changes nothing"; continue }
+            if (b.find.trimEnd() == b.replace.trimEnd()) { failed += "change $n: REPLACE is the same as FIND, so the new lines are missing"; continue }
             val veto = check?.invoke(b)
             if (veto != null) { failed += "change $n: $veto"; continue }
             val lines = text.split("\n")
@@ -107,6 +107,16 @@ object Patching {
     }
 
     private fun indent(s: String) = s.length - s.trimStart().length
+
+    /** Rejected blocks as "- find / + replace" with the reason, for the answer and later follow-ups. */
+    fun describeRejected(blocks: List<Block>, failed: List<String>, maxLines: Int = 8): String = buildString {
+        for ((i, b) in blocks.withIndex()) {
+            val why = failed.firstOrNull { it.startsWith("change ${i + 1}:") }?.substringAfter(": ") ?: continue
+            append("@@ rejected: ").append(why).append('\n')
+            b.find.split("\n").filter { it.isNotBlank() }.take(maxLines).forEach { append("- ").append(it).append('\n') }
+            b.replace.split("\n").filter { it.isNotBlank() }.take(maxLines).forEach { append("+ ").append(it).append('\n') }
+        }
+    }
 
     /** A new file shown as all-added lines. */
     fun created(content: String): String =

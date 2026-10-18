@@ -413,8 +413,20 @@ class CrewViewModel(app: Application) : AndroidViewModel(app) {
     private fun prevDocs(previous: RunState): String {
         if (previous.digest.isBlank()) return ""
         val done = previous.edits.filter { it.status == FileEdit.Status.DONE }
-        if (done.isEmpty()) return previous.digest
-        val changes = buildString {
+        // Rejected edits travel too, so "why was it rejected?" is answered from what really happened.
+        val turnedDown = previous.edits.filter { it.status == FileEdit.Status.SKIPPED && it.detail.isNotBlank() }
+        val rejectedNotes = if (turnedDown.isEmpty()) "" else buildString {
+            appendLine("Changes the crew proposed but the app rejected (the zip did NOT change for these):")
+            turnedDown.forEach { e ->
+                appendLine("- ${e.path}: ${e.instruction} → ${e.detail}")
+                if (e.diff.isNotBlank()) appendLine("  proposed:\n  " + e.diff.take(500).replace("\n", "\n  "))
+            }
+        }
+        if (done.isEmpty()) {
+            return if (rejectedNotes.isEmpty()) previous.digest
+            else ua.volodymyr.nanocrew.core.clip(rejectedNotes, 1_200) + "\n\n" + previous.digest
+        }
+        val changes = rejectedNotes + buildString {
             appendLine("Changes the crew already made to ${previous.archiveName ?: "the zip"} (this is the zip now):")
             done.forEach { e ->
                 append("- ${e.action.name} ${e.path}: ${e.instruction}")
