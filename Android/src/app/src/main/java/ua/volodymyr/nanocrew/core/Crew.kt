@@ -267,6 +267,16 @@ class Crew(
             val t = archive.files[p]
             if (t != null) "$p (${t.lines().size} lines)" else "$p (binary, can't edit)"
         }
+        // Small model, big zip: rather than planning from a listing of every file, look at the
+        // files the search found one part at a time and ask only "does this part need to change?".
+        val triaged = triage(task, ask, archive)
+        if (triaged.isNotEmpty()) {
+            val step = startStep(Role.PLANNER, "Plan · ${triaged.size} file${if (triaged.size == 1) "" else "s"} (checked part by part)")
+            endStep(step, triaged.joinToString("\n") { "${it.action.name} ${it.path}: ${it.instruction}" }, StepStatus.DONE)
+            DebugLog.d("crew", "triage plan: " + triaged.joinToString(" | ") { "${it.path}: ${it.instruction}" })
+            applyPlan(task, archive, triaged)
+            return
+        }
         val reply = call(Role.PLANNER, "Planning file changes", LlmRequest(
             system = config.prompts.editPlanner,
             prompt = "Task: $task\n" + docsBlock(Budget.DOCS_SHORT_CHARS) +
@@ -322,6 +332,10 @@ class Crew(
             return
         }
 
+        applyPlan(task, archive, planned)
+    }
+
+    private suspend fun applyPlan(task: String, archive: ArchiveInfo, planned: List<EditParsing.PlannedEdit>) {
         val edits = mutableListOf<FileEdit>()
         for (p in planned) {
             val e = when (p.action) {
@@ -333,6 +347,65 @@ class Crew(
             _state.update { it.copy(edits = edits.toList()) }
         }
         finish(editSummary(archive, edits))
+    }
+
+    /**
+     * Goes through the files the search ranked, a part at a time, and asks the model one small
+     * question per part: does this need to change for the task, and how (one sentence)? Parts are
+     * picked by how many of the request's words they contain, so the calls go where the code is.
+     * Returns the files to edit with what to do in each, best search match first; empty if nothing
+     * was found (then the ordinary planner runs).
+     */
+    private suspend fun triage(task: String, ask: String, archive: ArchiveInfo): List<EditParsing.PlannedEdit> {
+        if (searchHits.isEmpty()) return emptyList()
+        val words = FileSearch.keywords(ask).ifEmpty { searchHits.flatMap { it.words }.distinct() }
+        fun score(text: String): Int {
+            val low = text.lowercase()
+            return words.sumOf { w -> Regex(Regex.escape(w.lowercase())).findAll(low).count() }
+        }
+        // The best parts of the best files: up to 2 parts per file, TRIAGE_CALLS calls in all.
+        val candidates = searchHits.take(TRIAGE_FILES).mapNotNull { hit ->
+            val text = archive.files[hit.path] ?: return@mapNotNull null
+            val chunks = Chunker.split(text.replace("\r\n", "\n").removeSuffix("\n"))
+            val best = chunks.map { it to score(it.text) }.filter { it.second > 0 || chunks.size == 1 }
+                .sortedByDescending { it.second }.take(2).map { it.first }.sortedBy { it.index }
+            if (best.isEmpty()) null else Triple(hit.path, chunks.size, best)
+        }
+        val found = linkedMapOf<String, MutableList<String>>()
+        var calls = 0
+        loop@ for ((path, total, parts) in candidates) {
+            for (c in parts) {
+                if (calls >= TRIAGE_CALLS || found.size >= config.maxSubtasks) break@loop
+                calls++
+                val where = if (total == 1) "" else " · part ${c.index + 1}/$total"
+                val reply = call(Role.PLANNER, "Checking ${path.substringAfterLast('/')}$where", LlmRequest(
+                    system = TRIAGE,
+                    prompt = clip(
+                        "Task: $task\n\nFile `$path`" + (if (total == 1) "" else ", part ${c.index + 1} of $total (lines ${c.startLine + 1}–${c.endLine})") +
+                            ":\n```\n${c.text}\n```\n\nDoes this code need to change to do the task? One line:",
+                        Budget.PROMPT_CHARS,
+                    ),
+                    temperature = 0.1f, maxOutputTokens = 90,
+                ))
+                val change = parseTriage(reply)
+                retitleLast("Checking ${path.substringAfterLast('/')}$where · " + if (change == null) "no change here" else "needs a change")
+                if (change != null) found.getOrPut(path) { mutableListOf() } += change
+            }
+        }
+        DebugLog.d("crew", "triage: $calls calls over ${candidates.size} files, ${found.size} need changes")
+        return found.map { (path, what) ->
+            EditParsing.PlannedEdit(FileEdit.Action.EDIT, path, clip(what.distinct().joinToString("; "), 400))
+        }
+    }
+
+    /** "CHANGE: make minimize() hide the window instead of calling home()" → the sentence; "NO" → null. */
+    private fun parseTriage(reply: String): String? {
+        val line = reply.lines().map { it.trim().trim('*', '`', '-', ' ') }.firstOrNull { it.isNotBlank() } ?: return null
+        val m = Regex("""^(?:CHANGE|YES|EDIT|FIX)\b\s*[:\-–—]?\s*(.*)$""", RegexOption.IGNORE_CASE).find(line) ?: return null
+        val what = m.groupValues[1].trim().ifBlank {
+            reply.lines().drop(1).firstOrNull { it.isNotBlank() }?.trim().orEmpty()
+        }
+        return what.takeIf { it.length >= 8 }
     }
 
     private suspend fun createFile(task: String, path: String, instruction: String): FileEdit {
@@ -707,6 +780,15 @@ class Crew(
                 "Never delete an #include, import, class or function unless the request says so. " +
                 "Do not rewrite or reformat other lines. No explanations. If nothing here needs to change, reply NONE."
         const val MAX_LOCATE_CHUNKS = 20
+        /** Triage looks at this many of the best-matching files, with at most this many calls. */
+        const val TRIAGE_FILES = 6
+        const val TRIAGE_CALLS = 10
+        const val TRIAGE =
+            "You check one part of a file for a coding task. Reply with exactly one line:\n" +
+                "CHANGE: <what to change in this code, one sentence, naming the function or setting>\n" +
+                "or\n" +
+                "NO\n" +
+                "Say CHANGE only if the code shown here is what makes the task's problem happen or must be edited to fix it."
         /** The user asked for a new file (otherwise the crew only changes existing ones). */
         val CREATE_WORDS = Regex(
             """\b(create|new\s+file|add\s+(a\s+|an\s+)?(new\s+)?(file|script|module|page|readme|test)|write\s+(a\s+)?(new\s+)?(file|script)|generate)\b""",
