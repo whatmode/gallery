@@ -354,6 +354,13 @@ class Crew(
      */
     private suspend fun editFile(task: String, path: String, original: String, instruction: String): FileEdit {
         val text = original.replace("\r\n", "\n")
+        // "Add #include <X>" / "import a.b.C": the app does it itself — an addition, never a swap.
+        EditGuard.includeShortcut(path, text, instruction)?.let { s ->
+            DebugLog.d("crew", "edit $path: ${s.detail}")
+            if (!s.changed) return FileEdit(path, FileEdit.Action.EDIT, instruction, FileEdit.Status.SKIPPED, detail = s.detail)
+            val out = if (original.contains("\r\n")) s.text.replace("\n", "\r\n") else s.text
+            return FileEdit(path, FileEdit.Action.EDIT, instruction, FileEdit.Status.DONE, content = out, detail = s.detail, diff = s.diff)
+        }
         val chunks = Chunker.split(text.removeSuffix("\n"))
         val outline = if (chunks.size > 1) EditParsing.outline(text) else ""
 
@@ -387,7 +394,7 @@ class Crew(
             ))
             val blocks = Patching.parse(reply)
             if (blocks.isEmpty()) continue
-            val r = Patching.apply(current, blocks)
+            val r = Patching.apply(current, blocks) { b -> EditGuard.checkBlock(path, b.find, b.replace, instruction) }
             failed += r.failed
             if (r.applied > 0) {
                 current = r.text
@@ -404,7 +411,7 @@ class Crew(
         if (applied == 0) {
             return FileEdit(
                 path, FileEdit.Action.EDIT, instruction, FileEdit.Status.SKIPPED,
-                detail = if (failed.isNotEmpty()) "the proposed changes didn't match the file (${failed.first()}), so nothing was changed"
+                detail = if (failed.isNotEmpty()) "the proposed changes were rejected (${failed.first()}), so nothing was changed"
                 else "no changes were needed",
             )
         }
@@ -418,9 +425,17 @@ class Crew(
                 diff = diff.toString(),
             )
         }
+        // Syntax check: the brackets must balance the way they did before the change.
+        EditGuard.checkFile(path, text, current)?.let { why ->
+            DebugLog.d("crew", "edit $path: dropped by file check: $why")
+            return FileEdit(
+                path, FileEdit.Action.EDIT, instruction, FileEdit.Status.SKIPPED,
+                detail = "dropped: $why", diff = diff.toString(),
+            )
+        }
         val result = if (original.contains("\r\n")) current.replace("\n", "\r\n") else current
         val detail = "$applied change${if (applied == 1) "" else "s"}, $changedLines line${if (changedLines == 1) "" else "s"}" +
-            if (failed.isNotEmpty()) " · ${failed.size} rejected (didn't match the file)" else ""
+            if (failed.isNotEmpty()) " · ${failed.size} rejected (${failed.first().substringAfter(": ")})" else ""
         return FileEdit(path, FileEdit.Action.EDIT, instruction, FileEdit.Status.DONE, content = result, detail = detail, diff = diff.toString())
     }
 
@@ -638,6 +653,8 @@ class Crew(
                 "the same lines with the change made\n" +
                 ">>>>>>> REPLACE\n" +
                 "Rules: copy FIND lines character for character. Change only what the request needs. " +
+                "To add something, REPLACE must contain every FIND line plus the new line(s). " +
+                "Never delete an #include, import, class or function unless the request says so. " +
                 "Do not rewrite or reformat other lines. No explanations. If nothing here needs to change, reply NONE."
         const val MAX_LOCATE_CHUNKS = 20
         /** The user asked for a new file (otherwise the crew only changes existing ones). */

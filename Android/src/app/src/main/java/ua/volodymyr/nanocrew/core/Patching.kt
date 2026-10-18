@@ -50,7 +50,11 @@ object Patching {
         return blocks
     }
 
-    fun apply(original: String, blocks: List<Block>, maxFindLines: Int = 40): Result {
+    /**
+     * Applies [blocks] to [original]. [check] can veto a block before it is applied (it returns why,
+     * or null to allow it); see [EditGuard.checkBlock].
+     */
+    fun apply(original: String, blocks: List<Block>, maxFindLines: Int = 40, check: ((Block) -> String?)? = null): Result {
         var text = original
         var applied = 0
         var changed = 0
@@ -62,6 +66,8 @@ object Patching {
             if (findLines.isEmpty()) { failed += "change $n: nothing to find"; continue }
             if (findLines.size > maxFindLines) { failed += "change $n: too big (${findLines.size} lines)"; continue }
             if (b.find.trimEnd() == b.replace.trimEnd()) { failed += "change $n: changes nothing"; continue }
+            val veto = check?.invoke(b)
+            if (veto != null) { failed += "change $n: $veto"; continue }
             val lines = text.split("\n")
             val at = locate(lines, findLines)
             if (at.size != 1) {
