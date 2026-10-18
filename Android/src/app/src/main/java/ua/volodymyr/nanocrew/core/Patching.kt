@@ -25,6 +25,8 @@ object Patching {
         val diff: String,
         /** Lines removed plus lines added (after dropping lines that stayed the same). */
         val changedLines: Int,
+        /** Blocks whose change is already in the file (an earlier part made it): neither applied nor failed. */
+        val alreadyDone: Int = 0,
     )
 
     private val start = Regex("""^\s*<{5,}\s*(FIND|SEARCH|ORIGINAL|OLD)?\s*$""", RegexOption.IGNORE_CASE)
@@ -58,6 +60,7 @@ object Patching {
         var text = original
         var applied = 0
         var changed = 0
+        var done = 0
         val failed = mutableListOf<String>()
         val diff = StringBuilder()
         for ((i, b) in blocks.withIndex()) {
@@ -70,6 +73,11 @@ object Patching {
             if (veto != null) { failed += "change $n: $veto"; continue }
             val lines = text.split("\n")
             val at = locate(lines, findLines)
+            if (at.isEmpty()) {
+                // Already made (by an earlier part, or the model repeating itself): not a failure.
+                val replLines = b.replace.split("\n").dropWhile { it.isBlank() }.dropLastWhile { it.isBlank() }
+                if (replLines.isNotEmpty() && locate(lines, replLines).size == 1) { done++; continue }
+            }
             if (at.size != 1) {
                 failed += "change $n: " + (if (at.isEmpty()) "the lines to change aren't in the file" else "those lines appear ${at.size} times")
                 continue
@@ -94,7 +102,7 @@ object Patching {
             removed.forEach { diff.append("- ").append(it).append('\n') }
             added.forEach { diff.append("+ ").append(it).append('\n') }
         }
-        return Result(text, applied, failed, diff.toString().trimEnd(), changed)
+        return Result(text, applied, failed, diff.toString().trimEnd(), changed, done)
     }
 
     /** Start lines where [find] matches: exactly, else ignoring indentation and trailing spaces. */

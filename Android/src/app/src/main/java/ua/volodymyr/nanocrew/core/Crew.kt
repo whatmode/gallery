@@ -426,6 +426,27 @@ class Crew(
         return true
     }
 
+    /**
+     * One part's change, checked on its own: the original lines, the change as a diff, and what it
+     * was meant to do. Returns the problem, or null when the reviewer says OK.
+     */
+    private suspend fun reviewPart(task: String, path: String, before: String, change: String, instruction: String, title: String): String? {
+        val reply = call(Role.CRITIC, title, LlmRequest(
+            system = REVIEWER,
+            prompt = clip(
+                "Task: $task\n\nThe change was meant to: $instruction\n\nFile `$path`, the part before the change:\n```\n$before\n```\n\n" +
+                    "The change (- removed, + added):\n```\n$change\n```\n\nOne line, OK or PROBLEM: …",
+                Budget.PROMPT_CHARS,
+            ),
+            temperature = 0.0f, maxOutputTokens = 80,
+        ))
+        val line = reply.lines().map { it.trim().trim('*', '`', '-', ' ') }.firstOrNull { it.isNotBlank() } ?: return null
+        val m = Regex("""^(?:PROBLEM|ISSUE|WRONG|BUG|NO)\b\s*[:\-–—]?\s*(.*)$""", RegexOption.IGNORE_CASE).find(line)
+        val problem = m?.groupValues?.get(1)?.trim()?.takeIf { it.length >= 6 }
+        retitleLast(title + if (problem == null) " · OK" else " · problem found")
+        return problem
+    }
+
     /** "CHANGE: make minimize() hide the window instead of calling home()" → the sentence; "NO" → null. */
     private fun parseTriage(reply: String): String? {
         val line = reply.lines().map { it.trim().trim('*', '`', '-', ' ') }.firstOrNull { it.isNotBlank() } ?: return null
@@ -535,7 +556,7 @@ class Crew(
             }
             var r = Patching.apply(current, blocks, check = guard)
             // Everything rejected: tell the Editor why and let it try once more.
-            if (r.applied == 0 && r.failed.isNotEmpty()) {
+            if (r.applied == 0 && r.alreadyDone == 0 && r.failed.isNotEmpty()) {
                 rejected.append(Patching.describeRejected(blocks, r.failed))
                 retitleLast("$label$part · rejected (${r.failed.first().substringAfter(": ")}), retrying")
                 val retry = call(Role.EDITOR, "$label$part · retry", LlmRequest(
@@ -557,6 +578,35 @@ class Crew(
                     if (r2.applied > 0) { blocks = again; r = r2 } else {
                         rejected.append(Patching.describeRejected(again, r2.failed))
                         r = r2
+                    }
+                }
+            }
+            // Review: a second look at just this part — the original, the change, the instruction.
+            if (r.applied > 0) {
+                val reviewLabel = if ("editing" in label) label.replace("editing", "reviewing") else "Reviewing $path"
+                val problem = reviewPart(task, path, c.text, r.diff, partInstruction, "$reviewLabel$part")
+                if (problem != null) {
+                    rejected.append("@@ rejected by review: ").append(problem).append('\n').append(r.diff).append('\n')
+                    val fix = call(Role.EDITOR, "$label$part · fixing after review", LlmRequest(
+                        system = PATCH_EDITOR,
+                        prompt = clip(prompt, Budget.PROMPT_CHARS) +
+                            "\n\nYou proposed this change:\n" + clip(r.diff, 1_000) +
+                            "\nThe reviewer found a problem: " + problem +
+                            "\n\nWrite corrected change blocks against the part shown above (FIND copied from it exactly):",
+                        temperature = 0.2f,
+                        maxOutputTokens = 900,
+                    ))
+                    val fixed = Patching.parse(fix).let { if (it.isEmpty()) null else Patching.apply(current, it, check = guard) }
+                    val second = fixed?.takeIf { it.applied > 0 }?.let { f ->
+                        reviewPart(task, path, c.text, f.diff, partInstruction, "$reviewLabel$part · again")
+                    }
+                    if (fixed != null && fixed.applied > 0 && second == null) {
+                        r = fixed
+                    } else {
+                        val why = second ?: problem
+                        failed += "change ${if (fixed == null) 1 else fixed.applied}: review: $why"
+                        retitleLast("$label$part · dropped after review")
+                        r = r.copy(applied = 0)
                     }
                 }
             }
@@ -824,6 +874,11 @@ class Crew(
                 "Do not rewrite or reformat other lines. No explanations. If nothing here needs to change, reply NONE."
         const val MAX_LOCATE_CHUNKS = 20
         /** Triage looks at this many of the best-matching files, with at most this many calls. */
+        const val REVIEWER =
+            "You review one change to a file. Reply with exactly one line: OK, or PROBLEM: <what is wrong>.\n" +
+                "Say PROBLEM only for a real mistake: the change does not do what it was meant to, uses a name, " +
+                "argument or value the code doesn't have, leaves something half-done, or changes lines that have " +
+                "nothing to do with it. Style and wording are not problems."
         const val TRIAGE_FILES = 6
         const val TRIAGE_CALLS = 12
         val DOC_EXTS = setOf("md", "markdown", "txt", "rst", "adoc")
