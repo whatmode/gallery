@@ -370,7 +370,8 @@ class Crew(
                 else -> 0
             }
         }
-        val ranked = searchHits.withIndex().filter { kind(it.value.path) < 3 }
+        // A code fix never edits docs or data files (README, version.json, …) unless asked to.
+        val ranked = searchHits.withIndex().filter { kind(it.value.path) < 2 }
             .sortedWith(compareBy({ kind(it.value.path) }, { it.index })).map { it.value }
         val candidates = ranked.take(TRIAGE_FILES).mapNotNull { hit ->
             val text = archive.files[hit.path] ?: return@mapNotNull null
@@ -399,13 +400,13 @@ class Crew(
                 val reply = call(Role.PLANNER, "$agent · checking$where", LlmRequest(
                     system = TRIAGE,
                     prompt = clip(
-                        "Task: $context\n\nFile `$path`" + (if (total == 1) "" else ", part ${c.index + 1} of $total (lines ${c.startLine + 1}–${c.endLine})") +
+                        "Task: $task\n\nFile `$path`" + (if (total == 1) "" else ", part ${c.index + 1} of $total (lines ${c.startLine + 1}–${c.endLine})") +
                             ":\n```\n${c.text}\n```\n\nDoes this code need to change to do the task? One line:",
                         Budget.PROMPT_CHARS,
                     ),
                     temperature = 0.1f, maxOutputTokens = 90,
                 ))
-                val change = parseTriage(reply)
+                val change = parseTriage(reply)?.takeUnless { aboutAnotherFile(it, path, archive) }
                 retitleLast("$agent · checked$where · " + if (change == null) "no change here" else "needs a change")
                 if (change != null) what[c.index] = change
             }
@@ -430,12 +431,17 @@ class Crew(
      * One part's change, checked on its own: the original lines, the change as a diff, and what it
      * was meant to do. Returns the problem, or null when the reviewer says OK.
      */
-    private suspend fun reviewPart(task: String, path: String, before: String, change: String, instruction: String, title: String): String? {
+    private suspend fun reviewPart(
+        task: String, path: String, before: String, change: String, instruction: String, title: String, after: String,
+    ): String? {
         val reply = call(Role.CRITIC, title, LlmRequest(
             system = REVIEWER,
             prompt = clip(
-                "Task: $task\n\nThe change was meant to: $instruction\n\nFile `$path`, the part before the change:\n```\n$before\n```\n\n" +
-                    "The change (- removed, + added):\n```\n$change\n```\n\nOne line, OK or PROBLEM: …",
+                "Task: $task\n\nThe change was meant to: $instruction\n\nFile `$path`, the part BEFORE the change:\n```\n$before\n```\n\n" +
+                    "The change (- removed, + added):\n```\n$change\n```\n\nThe same part AFTER the change:\n```\n$after\n```\n\n" +
+                    "Check: 1) Does code that worked before still run for the cases it handled (nothing moved under a new " +
+                    "condition that skips it)? 2) Is every new command, function, key or value defined in what you see? " +
+                    "3) Does the change actually do what it was meant to?\nOne line, OK or PROBLEM: …",
                 Budget.PROMPT_CHARS,
             ),
             temperature = 0.0f, maxOutputTokens = 80,
@@ -445,6 +451,24 @@ class Crew(
         val problem = m?.groupValues?.get(1)?.trim()?.takeIf { it.length >= 6 }
         retitleLast(title + if (problem == null) " · OK" else " · problem found")
         return problem
+    }
+
+    /** The edited part as it reads in [edited]: the same start line, longer or shorter by the lines the change added. */
+    private fun afterPart(edited: String, c: Chunk, before: String): String {
+        val lines = edited.split("\n")
+        val grow = lines.size - before.split("\n").size
+        val end = (c.endLine + grow).coerceIn(c.startLine, lines.size)
+        return lines.subList(c.startLine.coerceAtMost(lines.size), end).joinToString("\n")
+    }
+
+    /** A finding that names a different file of the zip (and not this one) belongs to another agent. */
+    private fun aboutAnotherFile(finding: String, path: String, archive: ArchiveInfo): Boolean {
+        val mine = path.substringAfterLast('/')
+        if (finding.contains(mine, ignoreCase = true)) return false
+        return archive.allPaths.any { p ->
+            val n = p.substringAfterLast('/')
+            n != mine && n.contains('.') && n.length > 4 && finding.contains(n, ignoreCase = true)
+        }
     }
 
     /** "CHANGE: make minimize() hide the window instead of calling home()" → the sentence; "NO" → null. */
@@ -584,7 +608,7 @@ class Crew(
             // Review: a second look at just this part — the original, the change, the instruction.
             if (r.applied > 0) {
                 val reviewLabel = if ("editing" in label) label.replace("editing", "reviewing") else "Reviewing $path"
-                val problem = reviewPart(task, path, c.text, r.diff, partInstruction, "$reviewLabel$part")
+                val problem = reviewPart(task, path, c.text, r.diff, partInstruction, "$reviewLabel$part", afterPart(r.text, c, current))
                 if (problem != null) {
                     rejected.append("@@ rejected by review: ").append(problem).append('\n').append(r.diff).append('\n')
                     val fix = call(Role.EDITOR, "$label$part · fixing after review", LlmRequest(
@@ -598,7 +622,7 @@ class Crew(
                     ))
                     val fixed = Patching.parse(fix).let { if (it.isEmpty()) null else Patching.apply(current, it, check = guard) }
                     val second = fixed?.takeIf { it.applied > 0 }?.let { f ->
-                        reviewPart(task, path, c.text, f.diff, partInstruction, "$reviewLabel$part · again")
+                        reviewPart(task, path, c.text, f.diff, partInstruction, "$reviewLabel$part · again", afterPart(f.text, c, current))
                     }
                     if (fixed != null && fixed.applied > 0 && second == null) {
                         r = fixed
@@ -876,9 +900,10 @@ class Crew(
         /** Triage looks at this many of the best-matching files, with at most this many calls. */
         const val REVIEWER =
             "You review one change to a file. Reply with exactly one line: OK, or PROBLEM: <what is wrong>.\n" +
-                "Say PROBLEM only for a real mistake: the change does not do what it was meant to, uses a name, " +
-                "argument or value the code doesn't have, leaves something half-done, or changes lines that have " +
-                "nothing to do with it. Style and wording are not problems."
+                "Say PROBLEM for a real mistake: existing code no longer runs for cases it used to handle, the change " +
+                "uses a command, name, argument or value that isn't defined, it is half-done (a placeholder or comment " +
+                "instead of code), it breaks the file's syntax (a missing comma, bracket or quote), or it does not do " +
+                "what it was meant to. Style and wording are not problems."
         const val TRIAGE_FILES = 6
         const val TRIAGE_CALLS = 12
         val DOC_EXTS = setOf("md", "markdown", "txt", "rst", "adoc")

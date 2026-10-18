@@ -36,8 +36,8 @@ android {
     applicationId = "ua.volodymyr.crewgallery"
     minSdk = 31
     targetSdk = 37
-    versionCode = 61
-    versionName = "1.0.20-crew.16"
+    versionCode = 62
+    versionName = "1.0.20-crew.17"
 
     // Needed for HuggingFace auth workflows.
     // Use the scheme of the "Redirect URLs" in HuggingFace app.

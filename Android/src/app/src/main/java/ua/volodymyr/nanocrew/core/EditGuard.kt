@@ -257,6 +257,9 @@ object EditGuard {
             return "it deletes the declaration of $it"
         }
 
+        // JSON must still parse if it did before.
+        if (e == "json" && Json.valid(original)) Json.error(edited)?.let { return "the file is no longer valid JSON ($it)" }
+
         if (e !in braceLangs) return null
         val before = balance(original, e)
         val after = balance(edited, e)
@@ -305,5 +308,72 @@ object EditGuard {
             i++
         }
         return out
+    }
+
+    /** A small strict JSON checker (no library: this also runs in plain JVM tests). */
+    object Json {
+        fun valid(text: String) = error(text) == null
+
+        /** Null if [text] is valid JSON, else what's wrong and where. */
+        fun error(text: String): String? = try {
+            val p = P(text); p.ws(); p.value(); p.ws()
+            if (p.i < text.length) p.fail("extra text") else null
+        } catch (e: IllegalStateException) { e.message }
+
+        private class P(val s: String) {
+            var i = 0
+            fun fail(what: String): Nothing {
+                val line = s.substring(0, minOf(i, s.length)).count { it == '\n' } + 1
+                throw IllegalStateException("$what at line $line")
+            }
+            fun ws() { while (i < s.length && s[i] in " \t\r\n") i++ }
+            fun value() {
+                if (i >= s.length) fail("unexpected end")
+                when (s[i]) {
+                    '{' -> obj()
+                    '[' -> arr()
+                    '"' -> str()
+                    't' -> lit("true"); 'f' -> lit("false"); 'n' -> lit("null")
+                    else -> num()
+                }
+            }
+            fun lit(w: String) { if (!s.startsWith(w, i)) fail("bad value"); i += w.length }
+            fun num() {
+                val m = Regex("""-?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?""").matchAt(s, i) ?: fail("bad value")
+                i += m.value.length
+            }
+            fun str() {
+                i++
+                while (true) {
+                    if (i >= s.length) fail("unclosed string")
+                    when (s[i]) {
+                        '"' -> { i++; return }
+                        '\\' -> i += 2
+                        '\n' -> fail("line break inside a string")
+                        else -> i++
+                    }
+                }
+            }
+            fun arr() {
+                i++; ws()
+                if (i < s.length && s[i] == ']') { i++; return }
+                while (true) {
+                    ws(); value(); ws()
+                    if (i >= s.length) fail("unclosed [")
+                    when (s[i]) { ',' -> i++; ']' -> { i++; return }; else -> fail("missing , between list items") }
+                }
+            }
+            fun obj() {
+                i++; ws()
+                if (i < s.length && s[i] == '}') { i++; return }
+                while (true) {
+                    ws(); if (i >= s.length || s[i] != '"') fail("expected a key"); str(); ws()
+                    if (i >= s.length || s[i] != ':') fail("missing :"); i++
+                    ws(); value(); ws()
+                    if (i >= s.length) fail("unclosed {")
+                    when (s[i]) { ',' -> i++; '}' -> { i++; return }; else -> fail("missing , between entries") }
+                }
+            }
+        }
     }
 }

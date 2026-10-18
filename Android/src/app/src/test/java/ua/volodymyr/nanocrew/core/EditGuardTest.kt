@@ -101,4 +101,10 @@ class EditGuardTest {
         assertNotNull(EditGuard.checkCalls("bindsym Mod4+Down exec python3 /x/kwm.py act min", "bindsym Mod4+Down exec python3 /x/kwm.py act minimize", files))
         assertNull(EditGuard.checkCalls("bindsym Mod4+Down exec python3 /x/kwm.py act min", "bindsym Mod4+Down exec python3 /x/kwm.py act close", files))
     }
+
+    @Test fun jsonMustStayValid() {
+        val good = "{\n  \"notes\": [\n    \"one\",\n    \"two\"\n  ]\n}\n"
+        assertNotNull(EditGuard.checkFile("www/version.json", good, good.replace("\"one\",", "\"one\""), "fix buttons"))
+        assertNull(EditGuard.checkFile("www/version.json", good, good.replace("\"one\"", "\"uno\""), "fix buttons"))
+    }
 }
