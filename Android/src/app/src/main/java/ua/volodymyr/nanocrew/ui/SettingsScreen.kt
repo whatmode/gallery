@@ -90,6 +90,11 @@ fun SettingsScreen(
         Toggle("Auto-route simple requests", "Skip the full crew for quick questions", config.autoRoute) { v -> onChange { it.copy(autoRoute = v) } }
         Toggle("Critic review", "One extra pass that checks the workers' notes", config.useCritic) { v -> onChange { it.copy(useCritic = v) } }
         Toggle("Tools", "Calculator, clock and notes for the workers", config.useTools) { v -> onChange { it.copy(useTools = v) } }
+        Toggle(
+            "Think before editing",
+            "Gemma thinks first when it edits and reviews files. More careful, but each of those steps takes a few times longer.",
+            config.think,
+        ) { v -> onChange { it.copy(think = v) } }
 
         Spacer(Modifier.height(4.dp))
         Text("Max subtasks: ${config.maxSubtasks}", style = MaterialTheme.typography.bodyLarge)

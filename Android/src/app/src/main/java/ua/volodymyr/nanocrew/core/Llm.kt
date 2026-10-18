@@ -61,6 +61,8 @@ object Budget {
     /** How much attached-file content each agent sees. */
     val DOCS_CHARS get() = pick(2_500, 14_000)
     val DOCS_SHORT_CHARS get() = pick(1_400, 8_000)
+    /** Definitions from other files shown next to a part (cross-file lookup). */
+    val XREF_CHARS get() = pick(900, 3_600)
 
     /** Reader: files up to this size go in whole; longer ones are read part by part. */
     val INLINE_TOTAL_CHARS get() = pick(3_200, 14_000)
@@ -81,4 +83,19 @@ fun clip(text: String, maxChars: Int): String {
     val head = (maxChars * 0.7).toInt()
     val tail = maxChars - head - 7
     return t.take(head).trimEnd() + "\n[…]\n" + t.takeLast(tail).trimStart()
+}
+
+/** Gemma 4 thinking mode: the reasoning comes between these markers, the answer after them. */
+object Thinking {
+    private const val START = "<|channel>thought"
+    private const val END = "<channel|>"
+
+    /** (thought, answer); thought is null when the reply has no thought block. */
+    fun split(reply: String): Pair<String?, String> {
+        val s = reply.indexOf(START)
+        if (s < 0) return null to reply
+        val e = reply.indexOf(END, s)
+        if (e < 0) return reply.substring(s + START.length).trim() to ""   // cut off while still thinking
+        return reply.substring(s + START.length, e).trim() to (reply.substring(0, s) + reply.substring(e + END.length)).trim()
+    }
 }

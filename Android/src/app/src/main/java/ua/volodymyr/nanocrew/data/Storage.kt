@@ -113,6 +113,7 @@ class Storage(context: Context) {
             useTools = prefs.getBoolean("useTools", true),
             autoRoute = prefs.getBoolean("autoRoute", true),
             temperature = prefs.getFloat("temperature", 0.3f),
+            think = prefs.getBoolean("think", false),
             model = runCatching { ua.volodymyr.nanocrew.core.ModelChoice.valueOf(prefs.getString("model", "NANO")!!) }
                 .getOrDefault(ua.volodymyr.nanocrew.core.ModelChoice.NANO),
             prompts = AgentPrompts(
@@ -137,6 +138,7 @@ class Storage(context: Context) {
             .putBoolean("useTools", c.useTools)
             .putBoolean("autoRoute", c.autoRoute)
             .putFloat("temperature", c.temperature)
+            .putBoolean("think", c.think)
             .putString("model", c.model.name)
             .putString("p_router", c.prompts.router)
             .putString("p_planner", c.prompts.planner)

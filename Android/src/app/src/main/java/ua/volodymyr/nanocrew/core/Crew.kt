@@ -75,6 +75,8 @@ data class CrewConfig(
     val prompts: AgentPrompts = AgentPrompts(),
     /** Which on-device model the agents run on. */
     val model: ModelChoice = ModelChoice.NANO,
+    /** Gemma 4 thinks before answering (its thinking mode) in the Editor and Reviewer steps. Slower, more careful. */
+    val think: Boolean = false,
 )
 
 enum class ModelChoice(val label: String) {
@@ -401,7 +403,8 @@ class Crew(
                     system = TRIAGE,
                     prompt = clip(
                         "Task: $task\n\nFile `$path`" + (if (total == 1) "" else ", part ${c.index + 1} of $total (lines ${c.startLine + 1}–${c.endLine})") +
-                            ":\n```\n${c.text}\n```\n\nDoes this code need to change to do the task? One line:",
+                            ":\n```\n${c.text}\n```\n\n" + xref(c.text, path, Budget.XREF_CHARS / 2).let { if (it.isBlank()) "" else it + "\n\n" } +
+                            "Does this code need to change to do the task? One line:",
                         Budget.PROMPT_CHARS,
                     ),
                     temperature = 0.1f, maxOutputTokens = 90,
@@ -439,6 +442,7 @@ class Crew(
             prompt = clip(
                 "Task: $task\n\nThe change was meant to: $instruction\n\nFile `$path`, the part BEFORE the change:\n```\n$before\n```\n\n" +
                     "The change (- removed, + added):\n```\n$change\n```\n\nThe same part AFTER the change:\n```\n$after\n```\n\n" +
+                    xref(after, path, Budget.XREF_CHARS / 2).let { if (it.isBlank()) "" else it + "\n\n" } +
                     "Check: 1) Does code that worked before still run for the cases it handled (nothing moved under a new " +
                     "condition that skips it)? 2) Is every new command, function, key or value defined in what you see? " +
                     "3) Does the change actually do what it was meant to?\nOne line, OK or PROBLEM: …",
@@ -459,6 +463,14 @@ class Crew(
         val grow = lines.size - before.split("\n").size
         val end = (c.endLine + grow).coerceIn(c.startLine, lines.size)
         return lines.subList(c.startLine.coerceAtMost(lines.size), end).joinToString("\n")
+    }
+
+    /** Definitions from elsewhere in the zip that [part] uses (see [CrossRef]). */
+    private fun xref(part: String, path: String, maxChars: Int = Budget.XREF_CHARS): String {
+        val files = currentArchive?.files ?: return ""
+        val text = CrossRef.context(part, path, files, maxChars)
+        if (text.isNotBlank()) DebugLog.d("crew", "xref for $path: " + text.lines().filter { it.startsWith("---") }.joinToString(" "))
+        return text
     }
 
     /** A finding that names a different file of the zip (and not this one) belongs to another agent. */
@@ -544,15 +556,34 @@ class Crew(
                     append("Part ${c.index + 1} of ${chunks.size} (lines ${c.startLine + 1}–${c.endLine}):\n")
                 }
                 append("```\n").append(c.text).append("\n```\n\n")
+                xref(c.text, path).takeIf { it.isNotBlank() }?.let { append(it).append("\n\n") }
                 append("Write only the change blocks (or NONE if this part needs no change):")
             }
-            val reply = call(Role.EDITOR, "$label$part", LlmRequest(
+            var reply = call(Role.EDITOR, "$label$part", LlmRequest(
                 system = PATCH_EDITOR,
                 prompt = clip(prompt, Budget.PROMPT_CHARS + 1_500),
                 temperature = 0.1f,
                 maxOutputTokens = 700,
             ))
             var blocks = Patching.parse(reply)
+            // The Editor asked to see something first: look it up and ask again (once).
+            if (blocks.isEmpty()) {
+                val asked = LOOKUP.findAll(reply).map { it.groupValues[1] }.distinct().take(2).toList()
+                val files = currentArchive?.files
+                if (asked.isNotEmpty() && files != null) {
+                    val found = asked.joinToString("\n") { CrossRef.lookup(it, files, Budget.XREF_CHARS / asked.size) }
+                    DebugLog.d("crew", "edit $path: Editor looked up ${asked.joinToString()}")
+                    retitleLast("$label$part · looked up ${asked.joinToString()}")
+                    reply = call(Role.EDITOR, "$label$part · with ${asked.joinToString()}", LlmRequest(
+                        system = PATCH_EDITOR,
+                        prompt = clip(prompt, Budget.PROMPT_CHARS) + "\n\nWhat you looked up:\n" + found +
+                            "\n\nNow write the change blocks (or NONE):",
+                        temperature = 0.1f,
+                        maxOutputTokens = 900,
+                    ))
+                    blocks = Patching.parse(reply)
+                }
+            }
             if (blocks.isEmpty()) {
                 if (reply.trim().trim('`').trim().uppercase().startsWith("NONE") || reply.isBlank()) continue
                 // Wrote code, but not as change blocks: show the format once more.
@@ -862,9 +893,15 @@ class Crew(
     ): String {
         val step = startStep(role, title)
         _state.update { it.copy(modelCalls = it.modelCalls + 1) }
-        DebugLog.d("crew", "step ${step.id} ${role.name} \"$title\" → model call (prompt ${request.prompt.length} chars)")
+        // Thinking mode (Gemma 4): only where reasoning pays off, with room for the thoughts.
+        val thinking = config.think && Budget.useGemma && role in THINK_ROLES
+        val req = if (!thinking) request else request.copy(
+            system = THINK_TOKEN + request.system,
+            maxOutputTokens = request.maxOutputTokens + THINK_EXTRA_TOKENS,
+        )
+        DebugLog.d("crew", "step ${step.id} ${role.name} \"$title\" → model call (prompt ${request.prompt.length} chars${if (thinking) ", thinking" else ""})")
         val sb = StringBuilder()
-        val out = engine.generate(request) { chunk ->
+        val raw = engine.generate(req) { chunk ->
             if (!stream) return@generate
             if (chunk == LlmEngine.RESTART) sb.setLength(0) else sb.append(chunk)
             val text = sb.toString()
@@ -875,8 +912,11 @@ class Crew(
                 )
             }
         }.trim()
-        endStep(step, out, StepStatus.DONE)
-        DebugLog.d("crew", "step ${step.id} ${role.name} done in ${clock() - step.startedAt} ms · ${out.length} chars")
+        val (thought, out) = Thinking.split(raw)
+        if (thinking && thought == null) DebugLog.d("crew", "step ${step.id}: thinking was on but no thought block came back")
+        endStep(step, if (thought == null) out else "$out\n\n💭 thought for ${thought.length} chars", StepStatus.DONE)
+        DebugLog.d("crew", "step ${step.id} ${role.name} done in ${clock() - step.startedAt} ms · ${out.length} chars" +
+            (thought?.let { " · thought ${it.length} chars: " + DebugLog.peek(it, 300) } ?: ""))
         return out
     }
 
@@ -895,8 +935,14 @@ class Crew(
                 "Rules: copy FIND lines character for character. Change only what the request needs. " +
                 "To add something, REPLACE must contain every FIND line plus the new line(s). " +
                 "Never delete an #include, import, class or function unless the request says so. " +
-                "Do not rewrite or reformat other lines. No explanations. If nothing here needs to change, reply NONE."
+                "Do not rewrite or reformat other lines. No explanations. If nothing here needs to change, reply NONE.\n" +
+                "If you must see a function from another file before writing the change, reply only: LOOKUP: <name>"
         const val MAX_LOCATE_CHUNKS = 20
+        /** Gemma 4's switch for thinking mode, at the start of the system prompt. */
+        const val THINK_TOKEN = "<|think|>"
+        const val THINK_EXTRA_TOKENS = 900
+        val THINK_ROLES = setOf(Role.EDITOR, Role.CRITIC)
+        val LOOKUP = Regex("""(?im)^\W*LOOKUP\s*:\s*`?([A-Za-z_][\w.]*)""")
         /** Triage looks at this many of the best-matching files, with at most this many calls. */
         const val REVIEWER =
             "You review one change to a file. Reply with exactly one line: OK, or PROBLEM: <what is wrong>.\n" +
