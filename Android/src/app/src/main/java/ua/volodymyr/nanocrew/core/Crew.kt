@@ -400,7 +400,7 @@ class Crew(
             var r = Patching.apply(current, blocks, check = guard)
             // Everything rejected: tell the Editor why and let it try once more.
             if (r.applied == 0 && r.failed.isNotEmpty()) {
-                rejected += Patching.describeRejected(blocks, r.failed)
+                rejected.append(Patching.describeRejected(blocks, r.failed))
                 retitleLast("Editing $path$part · rejected (${r.failed.first().substringAfter(": ")}), retrying")
                 val retry = call(Role.EDITOR, "Editing $path$part · retry", LlmRequest(
                     system = PATCH_EDITOR,
@@ -416,7 +416,7 @@ class Crew(
                 if (again.isNotEmpty()) {
                     val r2 = Patching.apply(current, again, check = guard)
                     if (r2.applied > 0) { blocks = again; r = r2 } else {
-                        rejected += Patching.describeRejected(again, r2.failed)
+                        rejected.append(Patching.describeRejected(again, r2.failed))
                         r = r2
                     }
                 }
