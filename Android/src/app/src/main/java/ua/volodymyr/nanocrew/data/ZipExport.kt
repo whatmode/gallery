@@ -17,7 +17,13 @@ object ZipExport {
 
     private const val REGULAR_644 = 0x81A4 // S_IFREG | 0644
 
-    suspend fun build(original: File, out: File, edits: List<FileEdit>): File = withContext(Dispatchers.IO) {
+    suspend fun build(
+        original: File,
+        out: File,
+        edits: List<FileEdit>,
+        /** (entries written, entries in all) — called every few dozen entries. */
+        onProgress: (Int, Int) -> Unit = { _, _ -> },
+    ): File = withContext(Dispatchers.IO) {
         val done = edits.filter { it.status == FileEdit.Status.DONE }
         val deleted = done.filter { it.action == FileEdit.Action.DELETE }.map { it.path.trimStart('/') }.toSet()
         val byPath = done.filter { it.action != FileEdit.Action.DELETE }.associateBy { it.path }
@@ -27,7 +33,11 @@ object ZipExport {
         @Suppress("DEPRECATION")
         ZipFile(original).use { zf ->
             ZipArchiveOutputStream(out).use { zout ->
-                for (e in zf.entries.toList()) {
+                val all = zf.entries.toList()
+                var n = 0
+                onProgress(0, all.size)
+                for (e in all) {
+                    if (++n % 25 == 0) onProgress(n, all.size)
                     val path = e.name.replace('\\', '/').trimStart('/')
                     if (path in deleted) continue
                     if (!written.add(path)) continue // duplicate entries would make an invalid zip
@@ -55,6 +65,7 @@ object ZipExport {
                     zout.closeArchiveEntry()
                     written += path
                 }
+                onProgress(all.size, all.size)
             }
         }
         out
