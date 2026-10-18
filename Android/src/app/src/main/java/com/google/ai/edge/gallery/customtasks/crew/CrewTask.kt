@@ -98,7 +98,7 @@ class CrewTask(private val context: Context) : CustomTask {
     val target = CREW_CONTEXT_TOKENS.coerceAtMost(slider.sliderMax.toInt())
     if (current == slider.defaultValue.toInt() && target > current) {
       Log.d(TAG, "raising ${model.name} context $current → $target for the crew")
-      model.configValues = model.configValues + (ConfigKeys.MAX_TOKENS.label to target)
+      model.configValues = model.configValues + (ConfigKeys.MAX_TOKENS.label to target.toFloat())
     }
   }
 

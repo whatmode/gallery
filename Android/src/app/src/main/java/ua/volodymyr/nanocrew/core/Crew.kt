@@ -140,25 +140,35 @@ class Crew(
             // Look through every file of the zip for the request's words (no model call), so the
             // planner and workers start from the files that actually mention them.
             attachments.firstNotNullOfOrNull { it.archive }?.let { searchHits = searchArchive(rawTask, earlier, it) }
-            val toRead = attachments.filter { it.baseName !in alreadyRead }
+            val archive = attachments.firstNotNullOfOrNull { it.archive }
+            // An edit request whose words the search found: the Editor works from those files, so
+            // skip reading the whole zip part by part (minutes of "nothing relevant" on a big kit).
+            val edit = archive != null && wantsEdit(ask, archive)
+            val skipReading = edit && searchHits.isNotEmpty()
+            val toRead = if (skipReading) attachments.filter { it.archive == null && it.baseName !in alreadyRead }
+                else attachments.filter { it.baseName !in alreadyRead }
             if (knownDocs.isNotBlank()) {
                 val names = attachments.map { it.baseName }.filter { it in alreadyRead }.distinct()
                 val step = startStep(Role.READER, "Already read · ${names.joinToString(", ").ifBlank { "earlier files" }}")
                 endStep(step, "Using what the Reader found earlier in this conversation — no need to read it again.", StepStatus.DONE)
             }
+            if (skipReading && archive != null && archive.name !in alreadyRead) {
+                val step = startStep(Role.READER, "Reading · only the matching files")
+                endStep(step, "The search found where this is handled, so the Editor reads those files in full " +
+                    "instead of skimming all ${archive.allPaths.size}.", StepStatus.DONE)
+            }
             val fresh = if (toRead.isEmpty()) "" else Reading.digest(toRead, task, config.prompts) { title, req ->
                 call(Role.READER, title, req)
             }
             docs = listOf(knownDocs, fresh).filter { it.isNotBlank() }.joinToString("\n\n")
-            _state.update { it.copy(digest = docs) }
-            val archive = attachments.firstNotNullOfOrNull { it.archive }
+            if (!skipReading) _state.update { it.copy(digest = docs) }
             if (searchHits.isNotEmpty() && archive != null) {
                 docs = clip(
                     "Files in ${archive.name} that mention the request (best first):\n" + FileSearch.describe(searchHits, emptyList()),
                     Budget.DOCS_SHORT_CHARS / 2,
                 ) + "\n\n" + docs
             }
-            if (archive != null && wantsEdit(ask, archive)) {
+            if (edit && archive != null) {
                 editArchive(task, ask, archive)
                 return _state.value
             }
