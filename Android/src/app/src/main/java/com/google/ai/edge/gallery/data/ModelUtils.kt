@@ -36,6 +36,8 @@ fun Model.getTargetTaskIdsForImportedModel(): Set<String> {
     add(BuiltInTaskId.LLM_CHAT)
     add(BuiltInTaskId.LLM_PROMPT_LAB)
     add(BuiltInTaskId.LLM_AGENT_CHAT)
+    // Crew Gallery: models you import (e.g. Gemma 4 12B) can run the crew too.
+    add("nano_crew")
     if (supportImage) {
       add(BuiltInTaskId.LLM_ASK_IMAGE)
     }

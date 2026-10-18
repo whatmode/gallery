@@ -101,6 +101,8 @@ fun CrewHome(modelManagerViewModel: ModelManagerViewModel, bottomPadding: Dp) {
           outputMessage = outputMessage,
           onDismissOutputMessage = vm::dismissOutputMessage,
           waiting = waiting,
+          onApplyReview = vm::applyReview,
+          onDiscardReview = { vm.discardReview() },
         )
       1 ->
         HistoryScreen(

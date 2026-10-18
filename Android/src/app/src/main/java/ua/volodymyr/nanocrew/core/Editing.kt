@@ -20,6 +20,8 @@ data class FileEdit(
     val content: String = "",
     /** Human-readable detail: what changed, or why it was skipped. */
     val detail: String = "",
+    /** The change as "- old" / "+ new" lines, shown for review before the zip is packed. */
+    val diff: String = "",
 ) {
     enum class Action { EDIT, CREATE, DELETE }
     enum class Status { DONE, SKIPPED }

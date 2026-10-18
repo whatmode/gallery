@@ -62,6 +62,8 @@ data class RunState(
     val earlier: List<Turn> = emptyList(),
     /** What the Reader found in the attached files (reused by follow-ups instead of reading again). */
     val digest: String = "",
+    /** Edit mode: the changes wait for the user to apply or discard them before the zip is packed. */
+    val reviewPending: Boolean = false,
 )
 
 data class CrewConfig(
@@ -157,7 +159,7 @@ class Crew(
                 ) + "\n\n" + docs
             }
             if (archive != null && wantsEdit(ask, archive)) {
-                editArchive(task, archive)
+                editArchive(task, ask, archive)
                 return _state.value
             }
             val simple = config.autoRoute && route(ask)
@@ -247,7 +249,7 @@ class Crew(
         return hits
     }
 
-    private suspend fun editArchive(task: String, archive: ArchiveInfo) {
+    private suspend fun editArchive(task: String, ask: String, archive: ArchiveInfo) {
         _state.update { it.copy(archiveId = archive.id, archiveName = archive.name) }
         // Matching files first, so they are never cut off the end of a long listing.
         val ordered = searchHits.map { it.path } + archive.allPaths.filter { p -> searchHits.none { it.path == p } }
@@ -279,12 +281,30 @@ class Crew(
                     else -> "$p not in the zip"
                 }
             } else ""))
+        // New files only when asked for, never a near-copy of an existing file, never outside the zip's folders.
+        val dropped = mutableListOf<String>()
+        val roots = archive.allPaths.map { it.substringBefore('/') }.toSet()
+        fun norm(p: String) = p.substringAfterLast('/').lowercase().replace(Regex("[^a-z0-9]"), "")
+        planned = planned.filter { p ->
+            if (p.action != FileEdit.Action.CREATE) return@filter true
+            val twin = archive.allPaths.firstOrNull { norm(it) == norm(p.path) }
+            val why = when {
+                !CREATE_WORDS.containsMatchIn(ask) -> "you didn't ask for a new file"
+                twin != null -> "it looks like a copy of $twin"
+                p.path.contains('/') && roots.size == 1 && p.path.substringBefore('/') !in roots -> "it's outside ${roots.first()}/"
+                else -> null
+            }
+            if (why != null) dropped += "not creating ${p.path}: $why"
+            why == null
+        }
+        if (dropped.isNotEmpty()) DebugLog.d("crew", "plan guard: " + dropped.joinToString(" | "))
         if (planned.isEmpty() && archive.files.size == 1) {
             planned = listOf(EditParsing.PlannedEdit(FileEdit.Action.EDIT, archive.files.keys.first(), task))
         }
         replaceLastText(
-            if (planned.isEmpty()) reply.ifBlank { "(no plan)" }
-            else planned.joinToString("\n") { "${it.action.name} ${it.path}: ${it.instruction}" },
+            (if (planned.isEmpty()) reply.ifBlank { "(no plan)" }
+            else planned.joinToString("\n") { "${it.action.name} ${it.path}: ${it.instruction}" }) +
+                dropped.joinToString("") { "\n⛔ $it" },
         )
         retitleLast("Plan · ${planned.size} file${if (planned.size == 1) "" else "s"}")
         if (planned.isEmpty()) {
@@ -297,7 +317,7 @@ class Crew(
             val e = when (p.action) {
                 FileEdit.Action.EDIT -> editFile(task, p.path, archive.files.getValue(p.path), p.instruction)
                 FileEdit.Action.CREATE -> createFile(task, p.path, p.instruction)
-                FileEdit.Action.DELETE -> FileEdit(p.path, FileEdit.Action.DELETE, p.instruction, FileEdit.Status.DONE, detail = "removed")
+                FileEdit.Action.DELETE -> FileEdit(p.path, FileEdit.Action.DELETE, p.instruction, FileEdit.Status.DONE, detail = "removed", diff = "@@ whole file removed")
             }
             edits += e
             _state.update { it.copy(edits = edits.toList()) }
@@ -314,70 +334,84 @@ class Crew(
         ))
         val content = EditParsing.extractCode(reply)
         return if (content.isBlank()) FileEdit(path, FileEdit.Action.CREATE, instruction, FileEdit.Status.SKIPPED, detail = "Editor returned nothing")
-        else FileEdit(path, FileEdit.Action.CREATE, instruction, FileEdit.Status.DONE, content = content, detail = "${content.lines().size} lines")
+        else FileEdit(path, FileEdit.Action.CREATE, instruction, FileEdit.Status.DONE, content = content, detail = "${content.lines().size} lines", diff = Patching.created(content))
     }
 
-    /** Small files are rewritten whole; big files are split into chunks and only the relevant ones are rewritten. */
+    /**
+     * The Editor never retypes the file: for each relevant part it names the exact lines to change
+     * and what replaces them ([Patching]). Lines it can't find exactly are rejected, and an edit that
+     * changes far more than asked is dropped, so a small model can't quietly damage the file.
+     */
     private suspend fun editFile(task: String, path: String, original: String, instruction: String): FileEdit {
         val text = original.replace("\r\n", "\n")
-        val endsWithNewline = text.endsWith("\n")
-        val body = if (endsWithNewline) text.dropLast(1) else text
-        val chunks = Chunker.split(body)
-        val outline = if (chunks.size > 1) EditParsing.outline(body) else ""
+        val chunks = Chunker.split(text.removeSuffix("\n"))
+        val outline = if (chunks.size > 1) EditParsing.outline(text) else ""
 
-        // Which chunks need the change? Keywords first (free), then ask Nano chunk by chunk.
+        // Which parts need the change? Keywords first (free), then ask the model part by part.
         val targets: List<Chunk> = if (chunks.size == 1) chunks else locate(path, chunks, instruction)
         if (targets.isEmpty()) {
             return FileEdit(path, FileEdit.Action.EDIT, instruction, FileEdit.Status.SKIPPED, detail = "no part of the file matched the change")
         }
-        val toRewrite = targets.take(MAX_REWRITE_CHUNKS)
-        val newTexts = chunks.map { it.text }.toMutableList()
-        var changed = 0
-        var rejected = 0
-        for (c in toRewrite) {
+        var current = text
+        var applied = 0
+        var changedLines = 0
+        val failed = mutableListOf<String>()
+        val diff = StringBuilder()
+        for (c in targets.take(MAX_REWRITE_CHUNKS)) {
             val part = if (chunks.size == 1) "" else " · part ${c.index + 1}/${chunks.size} (lines ${c.startLine + 1}–${c.endLine})"
             val prompt = buildString {
                 append("Task: ").append(task).append('\n')
                 append("Change to make in `").append(path).append("`: ").append(instruction).append("\n\n")
                 if (chunks.size > 1) {
-                    append("The file is long, so you only see part ${c.index + 1} of ${chunks.size} ")
-                    append("(lines ${c.startLine + 1}–${c.endLine}). Outline of the whole file:\n").append(outline).append("\n\n")
-                    append("Rewrite ONLY this part. If nothing in it needs to change, return it unchanged.\n\n")
+                    append("Outline of the whole file:\n").append(outline).append("\n\n")
+                    append("Part ${c.index + 1} of ${chunks.size} (lines ${c.startLine + 1}–${c.endLine}):\n")
                 }
-                append("```\n").append(c.text).append("\n```\n\nThe complete updated ")
-                append(if (chunks.size > 1) "part:" else "file:")
+                append("```\n").append(c.text).append("\n```\n\n")
+                append("Write only the change blocks (or NONE if this part needs no change):")
             }
             val reply = call(Role.EDITOR, "Editing $path$part", LlmRequest(
-                system = config.prompts.editor,
+                system = PATCH_EDITOR,
                 prompt = clip(prompt, Budget.PROMPT_CHARS + 1_500),
                 temperature = 0.1f,
-                maxOutputTokens = (c.text.length / 3 + 300).coerceIn(400, 2_000),
+                maxOutputTokens = 700,
             ))
-            // Keep the chunk's own trailing blank lines so the stitched file lines up exactly.
-            val trailing = c.text.length - c.text.trimEnd('\n').length
-            val updated = EditParsing.extractCode(reply).trimEnd('\n') + "\n".repeat(trailing)
-            when {
-                // A much shorter result usually means Nano ran out of output room — keep the original.
-                c.text.length > 400 && updated.length < c.text.length * 0.5 -> { rejected++; retitleLast("Editing $path$part · looked cut off, kept original") }
-                updated.isBlank() -> rejected++
-                updated != c.text -> { newTexts[c.index] = updated; changed++ }
+            val blocks = Patching.parse(reply)
+            if (blocks.isEmpty()) continue
+            val r = Patching.apply(current, blocks)
+            failed += r.failed
+            if (r.applied > 0) {
+                current = r.text
+                applied += r.applied
+                changedLines += r.changedLines
+                if (diff.isNotEmpty()) diff.append('\n')
+                diff.append(r.diff)
             }
+            retitleLast("Editing $path$part · ${r.applied} of ${blocks.size} change${if (blocks.size == 1) "" else "s"} fit" +
+                if (r.failed.isNotEmpty()) " (${r.failed.size} rejected)" else "")
         }
+        DebugLog.d("crew", "edit $path: applied $applied, $changedLines lines changed, rejected ${failed.size}: ${failed.joinToString(" | ")}")
 
-        val skippedParts = targets.size - toRewrite.size
-        if (changed == 0) {
+        if (applied == 0) {
             return FileEdit(
                 path, FileEdit.Action.EDIT, instruction, FileEdit.Status.SKIPPED,
-                detail = if (rejected > 0) "the edit looked incomplete, so the original was kept" else "no changes were needed",
+                detail = if (failed.isNotEmpty()) "the proposed changes didn't match the file (${failed.first()}), so nothing was changed"
+                else "no changes were needed",
             )
         }
-        val result = Chunker.join(newTexts) + if (endsWithNewline) "\n" else ""
-        val detail = buildString {
-            append(if (chunks.size == 1) "rewritten" else "$changed of ${chunks.size} parts changed")
-            if (rejected > 0) append(", $rejected part${if (rejected > 1) "s" else ""} kept as-is (edit looked cut off)")
-            if (skippedParts > 0) append(", $skippedParts more matching part${if (skippedParts > 1) "s" else ""} not edited (limit $MAX_REWRITE_CHUNKS)")
+        // Damage check: a request touches a few lines; dozens changed means the model went astray.
+        val fileLines = text.split("\n").size
+        val limit = maxOf(30, fileLines / 5)
+        if (changedLines > limit) {
+            return FileEdit(
+                path, FileEdit.Action.EDIT, instruction, FileEdit.Status.SKIPPED,
+                detail = "dropped: it changed $changedLines lines (limit $limit for this file), far more than the request needs",
+                diff = diff.toString(),
+            )
         }
-        return FileEdit(path, FileEdit.Action.EDIT, instruction, FileEdit.Status.DONE, content = result, detail = detail)
+        val result = if (original.contains("\r\n")) current.replace("\n", "\r\n") else current
+        val detail = "$applied change${if (applied == 1) "" else "s"}, $changedLines line${if (changedLines == 1) "" else "s"}" +
+            if (failed.isNotEmpty()) " · ${failed.size} rejected (didn't match the file)" else ""
+        return FileEdit(path, FileEdit.Action.EDIT, instruction, FileEdit.Status.DONE, content = result, detail = detail, diff = diff.toString())
     }
 
     private suspend fun locate(path: String, chunks: List<Chunk>, instruction: String): List<Chunk> {
@@ -411,7 +445,7 @@ class Crew(
     private fun editSummary(archive: ArchiveInfo, edits: List<FileEdit>): String = buildString {
         val done = edits.count { it.status == FileEdit.Status.DONE }
         if (done > 0) {
-            append("Changed $done file${if (done == 1) "" else "s"} in **${archive.name}**. Save or share the new zip below.\n\n")
+            append("Proposed changes to $done file${if (done == 1) "" else "s"} in **${archive.name}**. Check them below, then tap **Apply & pack** to build the new zip.\n\n")
         } else {
             append("No files were changed in **${archive.name}**.\n\n")
         }
@@ -583,7 +617,24 @@ class Crew(
 
     private companion object {
         const val MAX_REWRITE_CHUNKS = 8
+
+        /** The Editor's instructions for change blocks (fixed: the parser depends on this format). */
+        const val PATCH_EDITOR =
+            "You are the Editor. You change a file by naming the exact lines to replace.\n" +
+                "For each change write one block:\n" +
+                "<<<<<<< FIND\n" +
+                "lines copied EXACTLY from the file (2 to 10 lines, enough to be unique)\n" +
+                "=======\n" +
+                "the same lines with the change made\n" +
+                ">>>>>>> REPLACE\n" +
+                "Rules: copy FIND lines character for character. Change only what the request needs. " +
+                "Do not rewrite or reformat other lines. No explanations. If nothing here needs to change, reply NONE."
         const val MAX_LOCATE_CHUNKS = 20
+        /** The user asked for a new file (otherwise the crew only changes existing ones). */
+        val CREATE_WORDS = Regex(
+            """\b(create|new\s+file|add\s+(a\s+|an\s+)?(new\s+)?(file|script|module|page|readme|test)|write\s+(a\s+)?(new\s+)?(file|script)|generate)\b""",
+            RegexOption.IGNORE_CASE,
+        )
         val EDIT_WORDS = Regex(
             "\\b(fix|edit|change|modify|update|rewrite|refactor|rename|translate|add|create|remove|delete|replace|comment|format|correct)\\b",
             RegexOption.IGNORE_CASE,

@@ -165,7 +165,14 @@ class CrewViewModel(app: Application) : AndroidViewModel(app) {
             DebugLog.d("crew", "start ignored (blank=${rawTask.isBlank()}, files=${newFiles.size}, busy=$busy)")
             return
         }
-        val previous = _run.value?.takeIf { canFollowUp }
+        // Changes still waiting for review when you write again count as discarded.
+        val previous = _run.value?.takeIf { canFollowUp }?.let { p ->
+            if (!p.reviewPending) p
+            else p.copy(
+                reviewPending = false,
+                edits = p.edits.map { e -> if (e.status == FileEdit.Status.DONE) e.copy(status = FileEdit.Status.SKIPPED, detail = "not applied", content = "") else e },
+            )
+        }
         val task = rawTask.ifBlank {
             if (newFiles.size == 1) "Summarize the attached file and pull out the key points."
             else "Summarize the attached files and pull out the key points."
@@ -201,61 +208,11 @@ class CrewViewModel(app: Application) : AndroidViewModel(app) {
                 collector.cancel()
                 var last = crew.state.value
                 if (last.id.isNotEmpty()) {
-                    // Edit mode: rebuild the zip with the Editor's changes.
+                    // Edit mode: the changes wait for review; the zip is packed when you tap Apply.
                     if (last.archiveId != null && last.archiveName != null &&
-                        last.edits.any { it.status == FileEdit.Status.DONE }
+                        last.edits.any { it.status == FileEdit.Status.DONE } && last.phase == Phase.DONE
                     ) {
-                        val name = ZipExport.outputName(last.archiveName!!)
-                        val changed = last.edits.count { it.status == FileEdit.Status.DONE }
-                        val tZip = System.currentTimeMillis()
-                        // Show the packing as a step of its own, and keep the run "working" until the zip is ready.
-                        val stepId = (last.steps.maxOfOrNull { it.id } ?: -1) + 1
-                        fun packing(text: String, status: ua.volodymyr.nanocrew.core.StepStatus, ended: Long? = null) {
-                            val step = ua.volodymyr.nanocrew.core.Step(
-                                id = stepId, role = ua.volodymyr.nanocrew.core.Role.TOOL,
-                                title = "Packing $name", text = text, status = status, startedAt = tZip, endedAt = ended,
-                            )
-                            _run.value = last.copy(
-                                phase = if (status == ua.volodymyr.nanocrew.core.StepStatus.RUNNING) Phase.RUNNING else last.phase,
-                                steps = last.steps.filter { it.id != stepId } + step,
-                            )
-                        }
-                        packing("Copying the zip with $changed changed file${if (changed == 1) "" else "s"}…", ua.volodymyr.nanocrew.core.StepStatus.RUNNING)
-                        last = withContext(NonCancellable) {
-                            try {
-                                var lastShown = 0L
-                                val out = ZipExport.build(
-                                    files.archiveFile(last.archiveId!!),
-                                    storage.outputFile(last.id, name),
-                                    last.edits,
-                                ) { done, total ->
-                                    val now = System.currentTimeMillis()
-                                    if (now - lastShown > 150 || done == total) {
-                                        lastShown = now
-                                        packing("$done of $total files · $changed changed", ua.volodymyr.nanocrew.core.StepStatus.RUNNING)
-                                    }
-                                }
-                                val ms = System.currentTimeMillis() - tZip
-                                DebugLog.d("files", "rebuilt ${out.name} in $ms ms · ${out.length()} bytes")
-                                val doneStep = ua.volodymyr.nanocrew.core.Step(
-                                    id = stepId, role = ua.volodymyr.nanocrew.core.Role.TOOL, title = "Packed $name",
-                                    text = "%.1f MB · $changed changed file${if (changed == 1) "" else "s"}, everything else copied as it was".format(out.length() / 1_048_576.0),
-                                    status = ua.volodymyr.nanocrew.core.StepStatus.DONE, startedAt = tZip, endedAt = System.currentTimeMillis(),
-                                )
-                                last.copy(outputPath = out.absolutePath, steps = last.steps + doneStep)
-                            } catch (e: Exception) {
-                                DebugLog.e("files", "couldn't rebuild the zip", e)
-                                val errStep = ua.volodymyr.nanocrew.core.Step(
-                                    id = stepId, role = ua.volodymyr.nanocrew.core.Role.TOOL, title = "Packing $name failed",
-                                    text = e.message ?: e.toString(), status = ua.volodymyr.nanocrew.core.StepStatus.ERROR,
-                                    startedAt = tZip, endedAt = System.currentTimeMillis(),
-                                )
-                                last.copy(
-                                    steps = last.steps + errStep,
-                                    finalAnswer = last.finalAnswer + "\n\n⚠️ Couldn't build the new zip: ${e.message}",
-                                )
-                            }
-                        }
+                        last = last.copy(reviewPending = true)
                     }
                     _run.value = last
                     // Save even when the run was stopped (the coroutine is cancelled at this point).
@@ -273,6 +230,96 @@ class CrewViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun stopCrew() { DebugLog.d("crew", "Stop pressed"); crewJob?.cancel() }
+
+
+    // ---- review -------------------------------------------------------------------------------
+
+    /**
+     * Applies the changes you kept (by path) and packs the new zip; the rest are marked discarded.
+     * Nothing is written into a zip before this.
+     */
+    fun applyReview(keep: Set<String>) {
+        val run0 = _run.value ?: return
+        if (!run0.reviewPending || crewJob?.isActive == true) return
+        DebugLog.d("crew", "review: applying ${keep.size} of ${run0.edits.count { it.status == FileEdit.Status.DONE }} changes")
+        crewJob = viewModelScope.launch {
+            var last = run0.copy(
+                reviewPending = false,
+                edits = run0.edits.map { e ->
+                    if (e.status == FileEdit.Status.DONE && e.path !in keep)
+                        e.copy(status = FileEdit.Status.SKIPPED, detail = "discarded by you", content = "")
+                    else e
+                },
+            )
+            val kept = last.edits.count { it.status == FileEdit.Status.DONE }
+            if (kept == 0) {
+                last = last.copy(finalAnswer = last.finalAnswer + "\n\nYou discarded all the changes — the zip stays as it was.")
+            } else {
+                val name = ZipExport.outputName(last.archiveName!!)
+                val changed = last.edits.count { it.status == FileEdit.Status.DONE }
+                val tZip = System.currentTimeMillis()
+                // Show the packing as a step of its own, and keep the run "working" until the zip is ready.
+                val stepId = (last.steps.maxOfOrNull { it.id } ?: -1) + 1
+                fun packing(text: String, status: ua.volodymyr.nanocrew.core.StepStatus, ended: Long? = null) {
+                    val step = ua.volodymyr.nanocrew.core.Step(
+                        id = stepId, role = ua.volodymyr.nanocrew.core.Role.TOOL,
+                        title = "Packing $name", text = text, status = status, startedAt = tZip, endedAt = ended,
+                    )
+                    _run.value = last.copy(
+                        phase = if (status == ua.volodymyr.nanocrew.core.StepStatus.RUNNING) Phase.RUNNING else last.phase,
+                        steps = last.steps.filter { it.id != stepId } + step,
+                    )
+                }
+                packing("Copying the zip with $changed changed file${if (changed == 1) "" else "s"}…", ua.volodymyr.nanocrew.core.StepStatus.RUNNING)
+                last = withContext(NonCancellable) {
+                    try {
+                        var lastShown = 0L
+                        val out = ZipExport.build(
+                            files.archiveFile(last.archiveId!!),
+                            storage.outputFile(last.id, name),
+                            last.edits,
+                        ) { done, total ->
+                            val now = System.currentTimeMillis()
+                            if (now - lastShown > 150 || done == total) {
+                                lastShown = now
+                                packing("$done of $total files · $changed changed", ua.volodymyr.nanocrew.core.StepStatus.RUNNING)
+                            }
+                        }
+                        val ms = System.currentTimeMillis() - tZip
+                        DebugLog.d("files", "rebuilt ${out.name} in $ms ms · ${out.length()} bytes")
+                        val doneStep = ua.volodymyr.nanocrew.core.Step(
+                            id = stepId, role = ua.volodymyr.nanocrew.core.Role.TOOL, title = "Packed $name",
+                            text = "%.1f MB · $changed changed file${if (changed == 1) "" else "s"}, everything else copied as it was".format(out.length() / 1_048_576.0),
+                            status = ua.volodymyr.nanocrew.core.StepStatus.DONE, startedAt = tZip, endedAt = System.currentTimeMillis(),
+                        )
+                        last.copy(outputPath = out.absolutePath, steps = last.steps + doneStep)
+                    } catch (e: Exception) {
+                        DebugLog.e("files", "couldn't rebuild the zip", e)
+                        val errStep = ua.volodymyr.nanocrew.core.Step(
+                            id = stepId, role = ua.volodymyr.nanocrew.core.Role.TOOL, title = "Packing $name failed",
+                            text = e.message ?: e.toString(), status = ua.volodymyr.nanocrew.core.StepStatus.ERROR,
+                            startedAt = tZip, endedAt = System.currentTimeMillis(),
+                        )
+                        last.copy(
+                            steps = last.steps + errStep,
+                            finalAnswer = last.finalAnswer + "\n\n⚠️ Couldn't build the new zip: ${e.message}",
+                        )
+                    }
+                }
+                last = last.copy(finalAnswer = last.finalAnswer.replace(
+                    "Check them below, then tap **Apply & pack** to build the new zip.",
+                    "Applied $kept — save or share the new zip below.",
+                ))
+            }
+            _run.value = last
+            withContext(NonCancellable) {
+                storage.saveRun(last)
+                _history.value = storage.loadRuns()
+            }
+        }
+    }
+
+    fun discardReview() = applyReview(emptySet())
 
     // ---- debug log ----------------------------------------------------------------------------
 

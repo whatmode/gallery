@@ -1,5 +1,8 @@
 package ua.volodymyr.nanocrew.ui
 
+import androidx.compose.ui.graphics.Color
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.animation.animateContentSize
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -91,6 +94,8 @@ fun CrewScreen(
     outputMessage: String? = null,
     onDismissOutputMessage: () -> Unit = {},
     waiting: String? = null,
+    onApplyReview: (Set<String>) -> Unit = {},
+    onDiscardReview: () -> Unit = {},
 ) {
     var input by rememberSaveable { mutableStateOf("") }
     val pickFiles = rememberFilePicker(onFilesPicked)
@@ -107,7 +112,7 @@ fun CrewScreen(
             if (run == null) {
                 IdleCrew(onPick = { input = it })
             } else {
-                RunTimeline(run, onSaveOutput, outputMessage, onDismissOutputMessage, waiting)
+                RunTimeline(run, onSaveOutput, outputMessage, onDismissOutputMessage, waiting, onApplyReview, onDiscardReview)
             }
         }
 
@@ -221,6 +226,8 @@ private fun RunTimeline(
     outputMessage: String?,
     onDismissOutputMessage: () -> Unit,
     waiting: String? = null,
+    onApplyReview: (Set<String>) -> Unit = {},
+    onDiscardReview: () -> Unit = {},
 ) {
     val listState = rememberLazyListState()
     val expanded = remember(run.id, run.earlier.size) { mutableStateMapOf<Int, Boolean>() }
@@ -265,6 +272,10 @@ private fun RunTimeline(
                                 }
                             }
                             MarkdownText(run.finalAnswer)
+                            if (run.reviewPending) {
+                                Spacer(Modifier.height(12.dp))
+                                ReviewChanges(run, onApplyReview, onDiscardReview)
+                            }
                             if (run.outputPath != null) {
                                 Spacer(Modifier.height(12.dp))
                                 OutputActions(run, onSaveOutput, outputMessage, onDismissOutputMessage)
@@ -404,6 +415,56 @@ private fun StepMeta(step: Step) {
             androidx.compose.material3.CircularProgressIndicator(Modifier.size(12.dp), strokeWidth = 1.5.dp, color = roleColor(step.role))
         parts.isNotEmpty() ->
             Text(parts.joinToString(" · "), style = MonoSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+}
+
+/** The proposed changes, file by file, as removed/added lines; you keep or drop each before packing. */
+@Composable
+private fun ReviewChanges(run: RunState, onApply: (Set<String>) -> Unit, onDiscard: () -> Unit) {
+    val proposed = run.edits.filter { it.status == ua.volodymyr.nanocrew.core.FileEdit.Status.DONE }
+    val keep = remember(run.id, run.edits) { mutableStateMapOf<String, Boolean>().apply { proposed.forEach { put(it.path, true) } } }
+    val removed = Color(0xFFE57373)
+    val added = Color(0xFF66BB6A)
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        SectionLabel("Review changes")
+        proposed.forEach { e ->
+            var all by remember(e.path) { mutableStateOf(false) }
+            Surface(shape = RoundedCornerShape(12.dp), color = MaterialTheme.colorScheme.surfaceContainer) {
+                Column(Modifier.fillMaxWidth().padding(10.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        androidx.compose.material3.Checkbox(checked = keep[e.path] == true, onCheckedChange = { keep[e.path] = it })
+                        Column(Modifier.weight(1f)) {
+                            Text("${e.action.name.lowercase()} ${e.path}", style = MaterialTheme.typography.bodyMedium)
+                            if (e.detail.isNotBlank()) Text(e.detail, style = MonoSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
+                    val lines = e.diff.ifBlank { "(no preview)" }.split("\n")
+                    val shown = if (all) lines else lines.take(40)
+                    Column(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(top = 6.dp)) {
+                        shown.forEach { l ->
+                            Text(
+                                l,
+                                style = MonoSmall,
+                                softWrap = false,
+                                color = when {
+                                    l.startsWith("- ") -> removed
+                                    l.startsWith("+ ") -> added
+                                    else -> MaterialTheme.colorScheme.onSurfaceVariant
+                                },
+                            )
+                        }
+                    }
+                    if (lines.size > 40) TextButton(onClick = { all = !all }) { Text(if (all) "Show less" else "Show all ${lines.size} lines") }
+                }
+            }
+        }
+        val n = keep.count { it.value }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            androidx.compose.material3.Button(onClick = { onApply(keep.filterValues { it }.keys) }, enabled = n > 0) {
+                Text("Apply & pack ($n)")
+            }
+            androidx.compose.material3.OutlinedButton(onClick = onDiscard) { Text("Discard") }
+        }
     }
 }
 

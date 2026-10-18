@@ -160,14 +160,16 @@ class Storage(context: Context) {
         .put("calls", r.modelCalls)
         .put("files", JSONArray(r.attachments))
         .put("archiveId", r.archiveId ?: "").put("archiveName", r.archiveName ?: "").put("output", r.outputPath ?: "")
-        .put("digest", r.digest)
+        .put("digest", r.digest).put("review", r.reviewPending)
         .put("earlier", JSONArray().apply {
             r.earlier.forEach { t -> put(JSONObject().put("task", t.task).put("answer", t.answer).put("files", JSONArray(t.attachments))) }
         })
         .put("edits", JSONArray().apply {
             r.edits.forEach { e ->
                 put(JSONObject().put("path", e.path).put("action", e.action.name).put("instruction", e.instruction)
-                    .put("status", e.status.name).put("detail", e.detail))
+                    .put("status", e.status.name).put("detail", e.detail).put("diff", e.diff)
+                    // The new content is kept only while it still waits for review.
+                    .put("content", if (r.reviewPending) e.content else ""))
             }
         })
         .put("steps", JSONArray().apply {
@@ -207,6 +209,7 @@ class Storage(context: Context) {
             archiveName = o.optString("archiveName", "").ifBlank { null },
             outputPath = o.optString("output", "").ifBlank { null },
             digest = o.optString("digest", ""),
+            reviewPending = o.optBoolean("review", false),
             earlier = o.optJSONArray("earlier")?.let { a ->
                 (0 until a.length()).map { i ->
                     val t = a.getJSONObject(i)
@@ -222,6 +225,7 @@ class Storage(context: Context) {
                     FileEdit(
                         e.getString("path"), FileEdit.Action.valueOf(e.getString("action")), e.optString("instruction"),
                         FileEdit.Status.valueOf(e.getString("status")), detail = e.optString("detail"),
+                        content = e.optString("content", ""), diff = e.optString("diff", ""),
                     )
                 }
             }.orEmpty(),
