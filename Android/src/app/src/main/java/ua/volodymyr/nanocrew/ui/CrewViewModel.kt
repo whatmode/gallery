@@ -343,7 +343,7 @@ class CrewViewModel(app: Application) : AndroidViewModel(app) {
             )
             out
         }
-        val uri = androidx.core.content.FileProvider.getUriForFile(context, context.packageName + ".files", file)
+        val uri = androidx.core.content.FileProvider.getUriForFile(context, CrewFileProvider.authority(context), file)
         val send = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
             type = "text/plain"
             putExtra(android.content.Intent.EXTRA_STREAM, uri)

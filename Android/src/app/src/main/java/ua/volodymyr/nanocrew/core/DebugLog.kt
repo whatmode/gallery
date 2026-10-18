@@ -30,7 +30,18 @@ object DebugLog {
     val recent: StateFlow<List<String>> = _recent.asStateFlow()
 
     fun init(directory: File) {
-        dir = directory.also { it.mkdirs() }
+        if (dir == null) dir = directory.also { it.mkdirs() }
+    }
+
+    /**
+     * Like [d] but written to the file before returning: for the last lines before something that
+     * can kill the app outright (loading a model that doesn't fit in memory).
+     */
+    fun dSync(tag: String, msg: String) {
+        d(tag, msg)
+        val done = java.util.concurrent.CountDownLatch(1)
+        writer.execute { done.countDown() }
+        done.await(2, java.util.concurrent.TimeUnit.SECONDS)
     }
 
     val file: File? get() = dir?.let { File(it, "debug.log") }

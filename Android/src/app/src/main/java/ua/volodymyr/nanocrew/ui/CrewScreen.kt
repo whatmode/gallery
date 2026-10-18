@@ -509,7 +509,7 @@ private fun OutputActions(
 }
 
 fun shareFile(context: android.content.Context, file: java.io.File) {
-    val uri = androidx.core.content.FileProvider.getUriForFile(context, context.packageName + ".provider", file)
+    val uri = androidx.core.content.FileProvider.getUriForFile(context, CrewFileProvider.authority(context), file)
     val send = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
         type = "application/zip"
         putExtra(android.content.Intent.EXTRA_STREAM, uri)

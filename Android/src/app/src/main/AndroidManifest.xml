@@ -116,6 +116,17 @@
                 android:resource="@xml/file_paths" />
         </provider>
 
+        <!-- Crew: shares edited zips and the debug log -->
+        <provider
+            android:name="ua.volodymyr.nanocrew.ui.CrewFileProvider"
+            android:authorities="${applicationId}.crewfiles"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/crew_file_paths" />
+        </provider>
+
         <service
             android:name="androidx.work.impl.foreground.SystemForegroundService"
             android:foregroundServiceType="dataSync"

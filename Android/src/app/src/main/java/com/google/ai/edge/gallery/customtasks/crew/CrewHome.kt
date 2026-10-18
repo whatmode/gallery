@@ -23,6 +23,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.google.ai.edge.gallery.ui.modelmanager.ModelManagerViewModel
@@ -71,10 +72,31 @@ fun CrewHome(modelManagerViewModel: ModelManagerViewModel, bottomPadding: Dp) {
     onDispose { view.keepScreenOn = false }
   }
 
+  val loadCrash by ua.volodymyr.nanocrew.core.LoadWatch.lastCrash.collectAsStateWithLifecycle()
+
   Column(Modifier.fillMaxSize().padding(bottom = bottomPadding).imePadding()) {
     PrimaryTabRow(selectedTabIndex = tab) {
       TABS.forEachIndexed { i, label ->
         Tab(selected = tab == i, onClick = { tab = i }, text = { Text(label) })
+      }
+    }
+    loadCrash?.let { msg ->
+      androidx.compose.material3.Surface(
+        color = androidx.compose.material3.MaterialTheme.colorScheme.errorContainer,
+        modifier = Modifier.fillMaxWidth(),
+      ) {
+        androidx.compose.foundation.layout.Row(
+          Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+          verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+        ) {
+          Text(
+            msg,
+            style = androidx.compose.material3.MaterialTheme.typography.bodySmall,
+            color = androidx.compose.material3.MaterialTheme.colorScheme.onErrorContainer,
+            modifier = Modifier.weight(1f),
+          )
+          androidx.compose.material3.TextButton(onClick = { ua.volodymyr.nanocrew.core.LoadWatch.dismiss() }) { Text("OK") }
+        }
       }
     }
     val m = Modifier.fillMaxWidth().weight(1f)

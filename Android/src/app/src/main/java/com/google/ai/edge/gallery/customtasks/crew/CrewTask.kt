@@ -28,6 +28,11 @@ private const val CREW_CONTEXT_TOKENS = 16000
  * the model Gallery loads, with files, zip editing, follow-ups, undo and history.
  */
 class CrewTask(private val context: Context) : CustomTask {
+  init {
+    // Reports a load that closed the app last time (checked once per app start).
+    ua.volodymyr.nanocrew.core.LoadWatch.init(context)
+  }
+
   override val task: Task =
     Task(
       id = CREW_TASK_ID,
@@ -59,13 +64,20 @@ class CrewTask(private val context: Context) : CustomTask {
     onDone: (String) -> Unit,
   ) {
     raiseContext(model)
+    val tokens = model.getIntConfigValue(ConfigKeys.MAX_TOKENS, defaultValue = 4000)
+    val file = runCatching { java.io.File(model.getPath(context)).length() / 1_048_576 }.getOrDefault(-1L)
+    val what = "${model.name} (${file} MB file, $tokens tokens, ${model.currentAccelerator?.label ?: "GPU"})"
+    ua.volodymyr.nanocrew.core.LoadWatch.starting(context, what)
     LlmChatModelHelper.initialize(
       context = context,
       model = model,
       taskId = task.id,
       supportImage = task.isVisionEnabled(model),
       supportAudio = false,
-      onDone = onDone,
+      onDone = { error ->
+        ua.volodymyr.nanocrew.core.LoadWatch.finished(context, what, error)
+        onDone(error)
+      },
       systemInstruction = null,
       tools = emptyList(),
       enableConversationConstrainedDecoding = false,
