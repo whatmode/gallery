@@ -86,7 +86,7 @@ object Patching {
             val oldLines = lines.subList(from, from + findLines.size)
             // Keep the file's indentation if the model shifted the whole block left or right.
             val shift = indent(oldLines.first { it.isNotBlank() }) - indent(findLines.first { it.isNotBlank() })
-            val newLines = b.replace.split("\n").dropWhile { it.isBlank() }.dropLastWhile { it.isBlank() }
+            val newLines = repair(b.replace.split("\n").dropWhile { it.isBlank() }.dropLastWhile { it.isBlank() }, findLines, oldLines)
                 .map { l -> if (l.isBlank()) l else if (shift > 0) " ".repeat(shift) + l else l.drop(minOf(-shift, indent(l)).coerceAtLeast(0)) }
             text = (lines.subList(0, from) + newLines + lines.subList(from + findLines.size, lines.size)).joinToString("\n")
             applied++
@@ -111,7 +111,73 @@ object Patching {
             (0..lines.size - find.size).filter { i -> find.indices.all { j -> eq(lines[i + j], find[j]) } }
         val exact = scan { a, b -> a == b }
         if (exact.isNotEmpty()) return exact
-        return scan { a, b -> a.trim() == b.trim() }
+        val trimmed = scan { a, b -> a.trim() == b.trim() }
+        if (trimmed.isNotEmpty()) return trimmed
+        return fuzzy(lines, find)
+    }
+
+    /**
+     * Small models miscopy long FIND blocks (`windowsdo` for `windows_do`, a shortened path). Accept
+     * a place where every line is close to the FIND line (and the whole block very close), but only
+     * if exactly one place in the file fits. Needs at least 3 non-blank lines, so a short FIND can't
+     * land somewhere it wasn't meant to.
+     */
+    private fun fuzzy(lines: List<String>, find: List<String>): List<Int> {
+        if (find.count { it.isNotBlank() } < 3 || find.size > lines.size) return emptyList()
+        val first = find.indexOfFirst { it.isNotBlank() }
+        val hits = mutableListOf<Int>()
+        for (i in 0..lines.size - find.size) {
+            if (similarity(lines[i + first].trim(), find[first].trim()) < 0.75) continue
+            var total = 0.0
+            var ok = true
+            for (j in find.indices) {
+                val sim = similarity(lines[i + j].trim(), find[j].trim())
+                if (sim < 0.7) { ok = false; break }
+                total += sim
+            }
+            if (ok && total / find.size >= 0.88) hits += i
+            if (hits.size > 1) return emptyList()
+        }
+        return hits
+    }
+
+    /** 1.0 for equal strings, falling with the edit distance relative to the longer one. */
+    internal fun similarity(a: String, b: String): Double {
+        if (a == b) return 1.0
+        if (a.isEmpty() || b.isEmpty()) return 0.0
+        if (kotlin.math.abs(a.length - b.length) > maxOf(a.length, b.length) / 3) return 0.0
+        var prev = IntArray(b.length + 1) { it }
+        var cur = IntArray(b.length + 1)
+        for (x in 1..a.length) {
+            cur[0] = x
+            for (y in 1..b.length) {
+                cur[y] = minOf(prev[y] + 1, cur[y - 1] + 1, prev[y - 1] + if (a[x - 1] == b[y - 1]) 0 else 1)
+            }
+            val t = prev; prev = cur; cur = t
+        }
+        return 1.0 - prev[b.length].toDouble() / maxOf(a.length, b.length)
+    }
+
+    private val word = Regex("""[A-Za-z0-9_./-]+""")
+
+    /**
+     * After a fuzzy match, the model's REPLACE carries the same typos as its FIND. Lines it left
+     * unchanged go back to the file's own text, and in changed lines the miscopied words are
+     * swapped for the file's (`windowsdo` → `windows_do`).
+     */
+    private fun repair(replace: List<String>, find: List<String>, file: List<String>): List<String> {
+        if (find == file) return replace
+        val sameLine = find.indices.associate { find[it].trim() to file[it] }
+        val words = mutableMapOf<String, String>()
+        for (j in find.indices) {
+            val f = word.findAll(find[j]).map { it.value }.toList()
+            val o = word.findAll(file[j]).map { it.value }.toList()
+            if (f.size == o.size) f.zip(o).forEach { (a, b) -> if (a != b && similarity(a, b) >= 0.6) words[a] = b }
+        }
+        return replace.map { r ->
+            sameLine[r.trim()]?.let { orig -> return@map " ".repeat(indent(r)) + orig.trimStart() }
+            if (words.isEmpty()) r else word.replace(r) { m -> words[m.value] ?: m.value }
+        }
     }
 
     private fun indent(s: String) = s.length - s.trimStart().length

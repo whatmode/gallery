@@ -465,6 +465,22 @@ class Crew(
         return lines.subList(c.startLine.coerceAtMost(lines.size), end).joinToString("\n")
     }
 
+    /**
+     * A part split into windows of about [EDIT_WINDOW_LINES] lines, keeping the ones the instruction
+     * is about (its names and words appear there), best two first. A short part is one window.
+     */
+    private fun editWindows(c: Chunk, instruction: String): List<Chunk> {
+        if (c.endLine - c.startLine <= EDIT_WINDOW_LINES + 10) return listOf(c)
+        val subs = Chunker.split(c.text, targetLines = EDIT_WINDOW_LINES, maxChars = Int.MAX_VALUE)
+            .map { w -> Chunk(c.index, c.startLine + w.startLine, c.startLine + w.endLine, w.text) }
+        val keys = EditParsing.keywords(instruction).map { it.lowercase() }
+        if (keys.isEmpty()) return listOf(c)
+        val scored = subs.map { w -> w to keys.sumOf { k -> Regex(Regex.escape(k)).findAll(w.text.lowercase()).count() } }
+            .filter { it.second > 0 }
+        if (scored.isEmpty()) return listOf(c)
+        return scored.sortedByDescending { it.second }.take(2).map { it.first }.sortedBy { it.startLine }
+    }
+
     /** Definitions from elsewhere in the zip that [part] uses (see [CrossRef]). */
     private fun xref(part: String, path: String, maxChars: Int = Budget.XREF_CHARS): String {
         val files = currentArchive?.files ?: return ""
@@ -527,7 +543,7 @@ class Crew(
             return FileEdit(path, FileEdit.Action.EDIT, instruction, FileEdit.Status.DONE, content = out, detail = s.detail, diff = s.diff)
         }
         val chunks = Chunker.split(text.removeSuffix("\n"))
-        val outline = if (chunks.size > 1) EditParsing.outline(text) else ""
+        val outline = if (chunks.size > 1 || text.count { it == '\n' } > EDIT_WINDOW_LINES) EditParsing.outline(text) else ""
 
         // Which parts need the change? Keywords first (free), then ask the model part by part.
         val targets: List<Chunk> = when {
@@ -545,15 +561,20 @@ class Crew(
         val diff = StringBuilder()
         /** What the Editor proposed and why it was turned down, kept for the answer and follow-ups. */
         val rejected = StringBuilder()
-        for (c in targets.take(MAX_REWRITE_CHUNKS)) {
+        // Edit in small windows: the Editor sees (and must copy back) only the lines around what
+        // the change is about, not a whole 250-line part.
+        val windows = targets.flatMap { t -> editWindows(t, parts?.get(t.index) ?: instruction) }
+        DebugLog.d("crew", "edit $path: ${targets.size} part(s) → ${windows.size} window(s): " +
+            windows.joinToString { "${it.startLine + 1}–${it.endLine}" })
+        for (c in windows.take(MAX_REWRITE_CHUNKS)) {
             val partInstruction = parts?.get(c.index) ?: instruction
-            val part = if (chunks.size == 1) "" else " · part ${c.index + 1}/${chunks.size} (lines ${c.startLine + 1}–${c.endLine})"
+            val part = if (chunks.size == 1 && windows.size == 1) "" else " · part ${c.index + 1}/${chunks.size} (lines ${c.startLine + 1}–${c.endLine})"
             val prompt = buildString {
                 append("Task: ").append(task).append('\n')
                 append("Change to make in `").append(path).append("`: ").append(partInstruction).append("\n\n")
-                if (chunks.size > 1) {
-                    append("Outline of the whole file:\n").append(outline).append("\n\n")
-                    append("Part ${c.index + 1} of ${chunks.size} (lines ${c.startLine + 1}–${c.endLine}):\n")
+                if (chunks.size > 1 || windows.size > 1) {
+                    if (outline.isNotBlank()) append("Outline of the whole file:\n").append(outline).append("\n\n")
+                    append("Lines ${c.startLine + 1}–${c.endLine} of the file:\n")
                 }
                 append("```\n").append(c.text).append("\n```\n\n")
                 xref(c.text, path).takeIf { it.isNotBlank() }?.let { append(it).append("\n\n") }
@@ -938,6 +959,8 @@ class Crew(
                 "Do not rewrite or reformat other lines. No explanations. If nothing here needs to change, reply NONE.\n" +
                 "If you must see a function from another file before writing the change, reply only: LOOKUP: <name>"
         const val MAX_LOCATE_CHUNKS = 20
+        /** Lines the Editor works on at a time. */
+        const val EDIT_WINDOW_LINES = 50
         /** Gemma 4's switch for thinking mode, at the start of the system prompt. */
         const val THINK_TOKEN = "<|think|>"
         const val THINK_EXTRA_TOKENS = 900

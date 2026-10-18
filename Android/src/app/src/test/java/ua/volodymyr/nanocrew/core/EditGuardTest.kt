@@ -107,4 +107,15 @@ class EditGuardTest {
         assertNotNull(EditGuard.checkFile("www/version.json", good, good.replace("\"one\",", "\"one\""), "fix buttons"))
         assertNull(EditGuard.checkFile("www/version.json", good, good.replace("\"one\"", "\"uno\""), "fix buttons"))
     }
+
+    @Test fun miscopiedFindStillLandsWithoutTheTypos() {
+        val file = "x = 1\n\ndef windows_do(d):\n    sys.path.insert(0, \"/usr/local/lib/kalyna\")\n    import kwm\n    a = d.get(\"action\")\n    return a\n"
+        val find = "def windowsdo(d):\n    sys.path.insert(0, \"/usr/lib/kalyna\")\n    import kwm\n    a = d.get(\"action\")"
+        val repl = "def windowsdo(d):\n    sys.path.insert(0, \"/usr/lib/kalyna\")\n    import kwm\n    a = d.get(\"action\")\n    log(a)"
+        val r = Patching.apply(file, listOf(Patching.Block(find, repl)))
+        assertEquals(1, r.applied)
+        assertTrue(r.text.contains("def windows_do(d):") && r.text.contains("/usr/local/lib/kalyna") && r.text.contains("    log(a)"))
+        // A short miscopy is not enough to be sure where it goes.
+        assertEquals(0, Patching.apply(file, listOf(Patching.Block("def windowsdo(d):", "def windowsdo(x):"))).applied)
+    }
 }
