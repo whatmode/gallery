@@ -44,6 +44,15 @@ jobs:
           echo "APK=CrewGallery-$VERSION.apk" >> "$GITHUB_ENV"
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
 
+      - name: Check the APK
+        run: |
+          BT=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)
+          A="$GITHUB_WORKSPACE/${{ env.APK }}"
+          { $BT/aapt2 dump badging "$A" 2>&1 | grep -E "^package|sdkVersion|native-code|uses-library" ;
+            $BT/apksigner verify -v "$A" 2>&1 | head -6 ;
+            $BT/zipalign -c -P 16 4 "$A" > /dev/null 2>&1 && echo "zipalign ok" || echo "zipalign FAILED" ;
+            unzip -l "$A" | tail -1 ; } | while IFS= read -r l; do echo "::notice::$l"; done
+
       - uses: actions/upload-artifact@v5
         with:
           name: CrewGallery-apk
