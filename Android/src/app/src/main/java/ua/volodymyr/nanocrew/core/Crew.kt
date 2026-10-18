@@ -127,6 +127,7 @@ class Crew(
         )
         nextStepId = 0
         docs = ""
+        searchHits = emptyList()
         _state.value = RunState(
             id = id, task = rawTask.trim(), startedAt = clock(),
             attachments = attachments.map { it.baseName }.distinct(),
@@ -134,6 +135,9 @@ class Crew(
         )
 
         try {
+            // Look through every file of the zip for the request's words (no model call), so the
+            // planner and workers start from the files that actually mention them.
+            attachments.firstNotNullOfOrNull { it.archive }?.let { searchHits = searchArchive(rawTask, earlier, it) }
             val toRead = attachments.filter { it.baseName !in alreadyRead }
             if (knownDocs.isNotBlank()) {
                 val names = attachments.map { it.baseName }.filter { it in alreadyRead }.distinct()
@@ -146,6 +150,12 @@ class Crew(
             docs = listOf(knownDocs, fresh).filter { it.isNotBlank() }.joinToString("\n\n")
             _state.update { it.copy(digest = docs) }
             val archive = attachments.firstNotNullOfOrNull { it.archive }
+            if (searchHits.isNotEmpty() && archive != null) {
+                docs = clip(
+                    "Files in ${archive.name} that mention the request (best first):\n" + FileSearch.describe(searchHits, emptyList()),
+                    Budget.DOCS_SHORT_CHARS / 2,
+                ) + "\n\n" + docs
+            }
             if (archive != null && wantsEdit(ask, archive)) {
                 editArchive(task, archive)
                 return _state.value
@@ -218,15 +228,40 @@ class Crew(
         return edit
     }
 
+    /** Files of the zip the request is about, best first (see [FileSearch]). */
+    private var searchHits: List<FileSearch.Hit> = emptyList()
+
+    private fun searchArchive(rawTask: String, earlier: List<Turn>, archive: ArchiveInfo): List<FileSearch.Hit> {
+        // "Can you fix it?" has no words to search for: use what was asked before as well.
+        var text = rawTask
+        if (FileSearch.keywords(text).size < 2) text += "\n" + earlier.takeLast(2).joinToString("\n") { it.task }
+        val words = FileSearch.keywords(text)
+        if (words.isEmpty()) return emptyList()
+        val step = startStep(Role.TOOL, "Searching ${archive.files.size} files")
+        val t0 = clock()
+        val hits = FileSearch.search(text, archive.files)
+        endStep(step, "Looked for: ${words.take(10).joinToString(", ")}\n\n" + FileSearch.describe(hits, words), StepStatus.DONE)
+        retitleLast(if (hits.isEmpty()) "Search · no file matches" else "Search · ${hits.size} file${if (hits.size == 1) "" else "s"} match")
+        DebugLog.d("crew", "search in ${clock() - t0} ms · words ${words.joinToString(",")} · " +
+            hits.joinToString { "${it.path} %.1f".format(it.score) }.ifBlank { "no hits" })
+        return hits
+    }
+
     private suspend fun editArchive(task: String, archive: ArchiveInfo) {
         _state.update { it.copy(archiveId = archive.id, archiveName = archive.name) }
-        val listing = archive.allPaths.take(150).joinToString("\n") { p ->
+        // Matching files first, so they are never cut off the end of a long listing.
+        val ordered = searchHits.map { it.path } + archive.allPaths.filter { p -> searchHits.none { it.path == p } }
+        val listing = ordered.take(150).joinToString("\n") { p ->
             val t = archive.files[p]
             if (t != null) "$p (${t.lines().size} lines)" else "$p (binary, can't edit)"
         }
         val reply = call(Role.PLANNER, "Planning file changes", LlmRequest(
             system = config.prompts.editPlanner,
             prompt = "Task: $task\n" + docsBlock(Budget.DOCS_SHORT_CHARS) +
+                (if (searchHits.isNotEmpty())
+                    "\nThe files above that mention the request are the likeliest place to change. Change the code that " +
+                        "does the work (.c, .cpp, .py, .qml, .sh, config), not only a header (.h) or a comment.\n"
+                else "") +
                 "\nFiles in ${archive.name}:\n${clip(listing, 3_000)}\n\n" +
                 "(Lines look like EDIT path: change, CREATE path: content, or DELETE path: why.)\n" +
                 "At most ${config.maxSubtasks} lines:",
