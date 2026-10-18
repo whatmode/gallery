@@ -395,7 +395,27 @@ class Crew(
                 maxOutputTokens = 700,
             ))
             var blocks = Patching.parse(reply)
-            if (blocks.isEmpty()) continue
+            if (blocks.isEmpty()) {
+                if (reply.trim().trim('`').trim().uppercase().startsWith("NONE") || reply.isBlank()) continue
+                // Wrote code, but not as change blocks: show the format once more.
+                retitleLast("Editing $path$part · not in change-block format, retrying")
+                val again = call(Role.EDITOR, "Editing $path$part · retry (format)", LlmRequest(
+                    system = PATCH_EDITOR,
+                    prompt = clip(prompt, Budget.PROMPT_CHARS) +
+                        "\n\nYour previous answer was code, not change blocks, so it could not be applied:\n" + clip(reply, 800) +
+                        "\n\nRewrite it as change blocks. Copy the existing lines it belongs to into FIND exactly, " +
+                        "and put those same lines plus your new code into REPLACE:\n" +
+                        "<<<<<<< FIND\n(existing lines)\n=======\n(existing lines + new code)\n>>>>>>> REPLACE",
+                    temperature = 0.2f,
+                    maxOutputTokens = 900,
+                ))
+                blocks = Patching.parse(again)
+                if (blocks.isEmpty()) {
+                    failed += "change 0: the Editor didn't write change blocks (twice)"
+                    rejected.append("@@ rejected: not in change-block format\n").append(clip(reply, 400)).append('\n')
+                    continue
+                }
+            }
             val guard: (Patching.Block) -> String? = { b -> EditGuard.checkBlock(path, b.find, b.replace, instruction) }
             var r = Patching.apply(current, blocks, check = guard)
             // Everything rejected: tell the Editor why and let it try once more.
@@ -407,9 +427,12 @@ class Crew(
                     prompt = clip(prompt, Budget.PROMPT_CHARS) +
                         "\n\nYour previous answer was rejected:\n" + r.failed.joinToString("\n") { "- $it" } +
                         "\nYou wrote:\n" + clip(reply, 1_000) +
-                        "\n\nFix it. REPLACE must be different from FIND and keep every FIND line that should stay. " +
+                        "\n\nFix it. " + (if (r.failed.any { "same as FIND" in it })
+                            "Keep FIND exactly as it is. In REPLACE write the NEW version of those lines that does this: " +
+                                instruction + ". REPLACE must contain new or changed code. "
+                        else "REPLACE must be different from FIND and keep every FIND line that should stay. ") +
                         "Write only the corrected change blocks:",
-                    temperature = 0.2f,
+                    temperature = 0.5f,
                     maxOutputTokens = 700,
                 ))
                 val again = Patching.parse(retry)

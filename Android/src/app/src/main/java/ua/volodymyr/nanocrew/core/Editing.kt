@@ -110,7 +110,8 @@ object EditParsing {
         if (path in all) return path
         all.firstOrNull { it.equals(path, ignoreCase = true) }?.let { return it }
         all.filter { it.substringAfterLast('/').equals(path.substringAfterLast('/'), ignoreCase = true) }.singleOrNull()?.let { return it }
-        return all.filter { it.endsWith("/$path", ignoreCase = true) }.singleOrNull()
+        all.filter { it.endsWith("/$path", ignoreCase = true) }.singleOrNull()?.let { return it }
+        return byLooseName(path, all)
     }
 
     /** Exact path, then case-insensitive, then a unique file-name match. Only text files are editable. */
@@ -120,7 +121,17 @@ object EditParsing {
         val byName = archive.files.keys.filter { it.substringAfterLast('/').equals(path.substringAfterLast('/'), ignoreCase = true) }
         if (byName.size == 1) return byName.first()
         val bySuffix = archive.files.keys.filter { it.endsWith("/$path", ignoreCase = true) }
-        return bySuffix.singleOrNull()
+        bySuffix.singleOrNull()?.let { return it }
+        return byLooseName(path, archive.files.keys)
+    }
+
+    /** Small models mix up `-`/`_`, case and dots in names: kalyna_bridge.py → kalyna-bridge.py. */
+    private fun looseKey(p: String) = p.substringAfterLast('/').lowercase().replace(Regex("[^a-z0-9.]"), "")
+
+    private fun byLooseName(path: String, candidates: Collection<String>): String? {
+        val k = looseKey(path)
+        if (k.length < 3) return null
+        return candidates.filter { looseKey(it) == k }.singleOrNull()
     }
 
     private val fence = Regex("""```[^\n`]*\n(.*?)\n?```""", RegexOption.DOT_MATCHES_ALL)
