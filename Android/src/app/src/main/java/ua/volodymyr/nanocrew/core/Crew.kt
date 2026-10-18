@@ -426,7 +426,7 @@ class Crew(
             )
         }
         // Syntax check: the brackets must balance the way they did before the change.
-        EditGuard.checkFile(path, text, current)?.let { why ->
+        EditGuard.checkFile(path, text, current, instruction)?.let { why ->
             DebugLog.d("crew", "edit $path: dropped by file check: $why")
             return FileEdit(
                 path, FileEdit.Action.EDIT, instruction, FileEdit.Status.SKIPPED,

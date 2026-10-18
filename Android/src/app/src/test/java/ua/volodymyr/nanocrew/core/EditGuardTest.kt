@@ -70,4 +70,29 @@ class EditGuardTest {
         assertNull(EditGuard.checkFile("a.cpp", "int a(){}\n", "int a(){ auto s = \"{(\"; // }}}\n /* ((( */ }\n"))
         assertNull(EditGuard.checkFile("README.md", "x", "{{{"))
     }
+
+    @Test fun anyPhrasingOfAddIncludeIsSafe() {
+        for (p in listOf(
+            "change line 18 to include <QQuickItem>",
+            "replace line 18 with #include <QQuickItem>",
+            "change line 2 to `#include <QQuickItem>`",
+            "Replace line 1 with include `<QQuickItem>`",
+        )) {
+            val s = EditGuard.includeShortcut("x/systemclient.cpp", cpp, p)!!
+            assertTrue(p, s.text.contains("<QJsonDocument>") && s.text.contains("<QQuickItem>"))
+            assertTrue(p, EditGuard.includeShortcut("x/shell.h", header, p)!!.text.contains("class Shell : public QObject {"))
+            assertEquals(p, 0, patch("systemclient.cpp", cpp, p, Patching.Block("\n#include <QJsonDocument>", "#include <QQuickItem>")).applied)
+            assertEquals(p, 0, patch("shell.h", header, p, Patching.Block("\nclass Shell : public QObject {", "")).applied)
+            assertNotNull(p, EditGuard.checkFile("systemclient.cpp", cpp, cpp.replace("#include <QJsonDocument>", "#include <QQuickItem>"), p))
+            assertNotNull(p, EditGuard.checkFile("shell.h", header, header.replace("class Shell : public QObject {\n", ""), p))
+        }
+    }
+
+    @Test fun namedRemovalsStillWork() {
+        val i = "remove QJsonDocument and add #include <QQuickItem>"
+        val r = patch("a.cpp", cpp, i, Patching.Block("#include <QJsonDocument>", "#include <QQuickItem>"))
+        assertEquals(1, r.applied)
+        assertNull(EditGuard.checkFile("a.cpp", cpp, r.text, i))
+        assertNotNull(EditGuard.checkFile("a.cpp", cpp, cpp, "add #include <QQuickItem>"))
+    }
 }

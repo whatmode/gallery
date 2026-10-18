@@ -27,7 +27,11 @@ object EditGuard {
 
     // ---------------------------------------------------------------- what the request asks for
 
-    private val removeWords = Regex("""\b(remove|delete|drop|replace|rename|swap|move|get\s+rid|unused|clean\s*up)\b""", RegexOption.IGNORE_CASE)
+    /** Words that really ask for something to go away. "change"/"replace"/"update" don't count. */
+    private val removeWords = Regex("""\b(remove|delete|drop|get\s+rid|unused|clean\s*up|strip)\b""", RegexOption.IGNORE_CASE)
+
+    /** Strips Markdown/quote noise so `<X>` and <X> read the same. */
+    private fun norm(instruction: String) = instruction.replace("`", "").replace("*", "")
     private val addWords = Regex("""\b(add|include|import|insert|append|introduce|declare|create|define|implement)\b""", RegexOption.IGNORE_CASE)
 
     /** `<QQuickItem>` / `"shell.h"` named in an instruction, as written after #include or "include". */
@@ -36,11 +40,11 @@ object EditGuard {
     private val importTarget = Regex("""\bimport\s+((?:static\s+)?[A-Za-z_][\w.]*(?:\.\*)?)""")
 
     /** The include the instruction asks for, normalised to `<X>` / `"X"`, or null. */
-    fun requestedInclude(instruction: String): String? = includeTarget.find(instruction)?.groupValues?.get(1)
+    fun requestedInclude(instruction: String): String? = includeTarget.find(norm(instruction))?.groupValues?.get(1)
 
     /** The import the instruction asks for, or null. */
     fun requestedImport(instruction: String): String? =
-        importTarget.find(instruction)?.groupValues?.get(1)?.takeIf { it.contains('.') }
+        importTarget.find(norm(instruction))?.groupValues?.get(1)?.takeIf { it.contains('.') }
 
     // ---------------------------------------------------------------- 1) adds done by the app
 
@@ -55,13 +59,16 @@ object EditGuard {
      * deterministically: inserted after the last existing include/import, nothing removed.
      * Returns null when the instruction asks for more than that, so the Editor handles it.
      */
-    fun includeShortcut(path: String, text: String, instruction: String): Shortcut? {
+    fun includeShortcut(path: String, text: String, rawInstruction: String): Shortcut? {
+        val instruction = norm(rawInstruction)
         if (removeWords.containsMatchIn(instruction)) return null
+        // "replace <A> with <B>" names two headers: that's a real swap, leave it to the Editor.
+        if (includeTarget.findAll(instruction).count() > 1 || Regex("""<\w[\w/.]*>""").findAll(instruction).count() > 1) return null
         // Only when adding the include is the whole job ("add #include <X>", "include <X> in foo.cpp").
         val rest = instruction
             .replace(includeTarget, " ")
             .replace(importTarget, " ")
-            .replace(Regex("""\b(line\s+\d+|at\s+the\s+top|top\s+of\s+the\s+file|header|file|to|in|into|the|a|an|missing|needed|for|add|include|import|so\s+it\s+compiles|change|update|fix)\b""", RegexOption.IGNORE_CASE), " ")
+            .replace(Regex("""\b(lines?\s+\d+|at\s+the\s+top|top\s+of\s+the\s+file|header|file|to|in|into|the|a|an|missing|needed|for|add|include|import|so\s+it\s+compiles|change|update|fix|replace|with|set|make|it|line|after|before|statement|directive)\b""", RegexOption.IGNORE_CASE), " ")
             .replace(Regex("""[`'".,:;()\-—–]|\S+\.(?:cpp|cc|c|h|hpp|kt|java|py|go|swift|dart)\b"""), " ")
             .trim()
         if (rest.split(Regex("\\s+")).count { it.length > 2 } > 2) return null
@@ -134,38 +141,49 @@ object EditGuard {
             """(?:class|struct|interface|object|enum|union|namespace|fun|def|func|fn|function|trait|impl|module)\b\s*\w+""",
     )
 
-    /** Why [find] → [replace] doesn't fit [instruction] for [path], or null if it does. */
-    fun checkBlock(path: String, find: String, replace: String, instruction: String): String? {
+    /** True when the instruction names [thing] (a header, import or declaration) for removal. */
+    private fun namesForRemoval(instruction: String, thing: String): Boolean {
+        val i = norm(instruction)
+        if (!removeWords.containsMatchIn(i)) return false
+        val key = thing.trim().trim('<', '>', '"').substringAfterLast('/').substringAfterLast('.').ifBlank { thing }
+        return i.contains(key, ignoreCase = true) || Regex("""\bunused\b""", RegexOption.IGNORE_CASE).containsMatchIn(i)
+    }
+
+    private fun includeOf(line: String) = includeLine.find(line)?.groupValues?.get(1) ?: importLine.find(line)?.groupValues?.get(1)
+
+    /** Why [find] → [replace] doesn't fit [rawInstruction] for [path], or null if it does. */
+    fun checkBlock(path: String, find: String, replace: String, rawInstruction: String): String? {
+        val instruction = norm(rawInstruction)
         val old = find.split("\n").map { it.trimEnd() }
         val new = replace.split("\n").map { it.trimEnd() }
         val oldReal = old.filter { it.isNotBlank() }
         val newReal = new.filter { it.isNotBlank() }
         val removed = oldReal.filter { o -> newReal.none { it.trim() == o.trim() } }
         val added = newReal.filter { n -> oldReal.none { it.trim() == n.trim() } }
-        val asksRemove = removeWords.containsMatchIn(instruction)
-        val asksAdd = addWords.containsMatchIn(instruction)
 
-        // Asked to add something, got only deletions.
-        if (asksAdd && !asksRemove && added.isEmpty() && removed.isNotEmpty()) {
-            return "it only deletes lines, but the request is to add something"
+        // Only deletions: allowed only when the request really says to remove something.
+        if (added.isEmpty() && removed.isNotEmpty() && !removeWords.containsMatchIn(instruction)) {
+            return "it only deletes lines, but the request doesn't ask to remove anything"
         }
-        // Asked for a specific include/import that the block doesn't write.
+        // Asked for a specific include that the block doesn't write, while touching includes.
         requestedInclude(instruction)?.let { inc ->
-            if (ext(path) in includeLangs && !asksRemove && added.none { a -> includeLine.find(a)?.groupValues?.get(1) == inc } &&
+            if (ext(path) in includeLangs && added.none { a -> includeLine.find(a)?.groupValues?.get(1) == inc } &&
                 removed.any { includeLine.containsMatchIn(it) }
             ) return "it touches the includes but doesn't add #include $inc"
         }
-        // Includes/imports are only ever added unless the request says to remove or replace one.
-        if (!asksRemove) {
-            removed.firstOrNull { includeLine.containsMatchIn(it) || importLine.matches(it) }?.let {
-                return "it removes `${it.trim()}`, which the request didn't ask for"
+        // Includes/imports are only removed when the request names them.
+        removed.forEach { r ->
+            val inc = includeOf(r) ?: return@forEach
+            if (added.none { includeOf(it) == inc } && !namesForRemoval(instruction, inc)) {
+                return "it removes `${r.trim()}`, which the request didn't ask for"
             }
         }
-        // A declaration disappearing (not renamed in place) breaks everything that uses it.
+        // A declaration may change in place (same name), but not disappear unless named for removal.
         removed.filter { declaration.containsMatchIn(it) }.forEach { d ->
-            val name = declaredName(d)
-            val stillThere = name != null && added.any { declaredName(it) == name }
-            if (!stillThere && !asksRemove) return "it deletes the declaration `${d.trim().take(60)}`"
+            val name = declaredName(d) ?: return@forEach
+            if (added.none { declaredName(it) == name } && !namesForRemoval(instruction, name)) {
+                return "it deletes the declaration `${d.trim().take(60)}`"
+            }
         }
         return null
     }
@@ -176,11 +194,41 @@ object EditGuard {
 
     // ---------------------------------------------------------------- 3) the whole file
 
-    /** Why the edited file is broken in a way the original wasn't, or null. */
-    fun checkFile(path: String, original: String, edited: String): String? {
-        if (ext(path) !in braceLangs) return null
-        val before = balance(original, ext(path))
-        val after = balance(edited, ext(path))
+    /**
+     * Why the edited file is broken in a way the original wasn't, or null. Checked on the whole
+     * result, so it holds however the model split or worded its blocks:
+     *  - every include/import and every declared class/struct/function name is still there,
+     *    unless the request names it for removal;
+     *  - an include/import the request asks for is really there;
+     *  - {} () [] balance the way they did.
+     */
+    fun checkFile(path: String, original: String, edited: String, rawInstruction: String = ""): String? {
+        val instruction = norm(rawInstruction)
+        val e = ext(path)
+        val beforeLines = original.split("\n")
+        val afterLines = edited.split("\n")
+
+        val incBefore = beforeLines.mapNotNull { includeOf(it) }.toSet()
+        val incAfter = afterLines.mapNotNull { includeOf(it) }.toSet()
+        (incBefore - incAfter).firstOrNull { !namesForRemoval(instruction, it) }?.let {
+            return "it removes the include/import $it, which the request didn't ask for"
+        }
+        if (e in includeLangs) requestedInclude(instruction)?.let { inc ->
+            if (inc !in incAfter && !removeWords.containsMatchIn(instruction)) return "the request asks for #include $inc but the file doesn't have it"
+        }
+        if (e in importLangs) requestedImport(instruction)?.let { imp ->
+            if (imp !in incAfter && !removeWords.containsMatchIn(instruction)) return "the request asks for import $imp but the file doesn't have it"
+        }
+
+        val declBefore = beforeLines.filter { declaration.containsMatchIn(it) }.mapNotNull { declaredName(it) }.toSet()
+        val declAfter = afterLines.filter { declaration.containsMatchIn(it) }.mapNotNull { declaredName(it) }.toSet()
+        (declBefore - declAfter).firstOrNull { !namesForRemoval(instruction, it) }?.let {
+            return "it deletes the declaration of $it"
+        }
+
+        if (e !in braceLangs) return null
+        val before = balance(original, e)
+        val after = balance(edited, e)
         val pairs = listOf("{}" to 0, "()" to 1, "[]" to 2)
         for ((name, i) in pairs) {
             if (before[i] != after[i]) {
