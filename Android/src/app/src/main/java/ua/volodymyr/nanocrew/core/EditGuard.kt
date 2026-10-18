@@ -188,6 +188,37 @@ object EditGuard {
         return null
     }
 
+    /**
+     * A line that runs another file of the zip with arguments (`kwm.py act min`) may only switch an
+     * argument to one that file actually knows: "min" → "minimize" is rejected when kwm.py checks
+     * for "min" and never mentions "minimize". [files] is path → text for the whole zip.
+     */
+    fun checkCalls(find: String, replace: String, files: Map<String, String>): String? {
+        val old = find.split("\n").map { it.trim() }.filter { it.isNotBlank() }
+        val new = replace.split("\n").map { it.trim() }.filter { it.isNotBlank() }
+        for (n in new) {
+            if (old.contains(n)) continue
+            val target = files.keys.firstOrNull { p ->
+                val f = p.substringAfterLast('/')
+                f.contains('.') && f.length > 3 && Regex("""(^|[\s/"'])""" + Regex.escape(f) + """(\s|$)""").containsMatchIn(n)
+            } ?: continue
+            val script = files[target] ?: continue
+            val f = target.substringAfterLast('/')
+            // The line it replaces: the old line that calls the same file.
+            val before = old.firstOrNull { it.contains(f) } ?: continue
+            val newArgs = n.substringAfter(f).trim().split(Regex("\\s+")).filter { it.isNotBlank() }
+            val oldArgs = before.substringAfter(f).trim().split(Regex("\\s+")).filter { it.isNotBlank() }
+            for ((i, a) in newArgs.withIndex()) {
+                val was = oldArgs.getOrNull(i) ?: continue
+                if (a == was || !Regex("""^[A-Za-z][\w-]*$""").matches(a)) continue
+                val knowsOld = Regex("""["']${Regex.escape(was)}["']""").containsMatchIn(script)
+                val knowsNew = Regex("""["']${Regex.escape(a)}["']""").containsMatchIn(script)
+                if (knowsOld && !knowsNew) return "$f accepts \"$was\" but not \"$a\", so the changed call would do nothing"
+            }
+        }
+        return null
+    }
+
     private fun declaredName(line: String): String? =
         Regex("""\b(?:class|struct|interface|object|enum|union|namespace|fun|def|func|fn|function|trait|impl|module)\s+(\w+)""")
             .find(line)?.groupValues?.get(1)

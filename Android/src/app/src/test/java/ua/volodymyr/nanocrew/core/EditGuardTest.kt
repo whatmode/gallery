@@ -95,4 +95,10 @@ class EditGuardTest {
         assertNull(EditGuard.checkFile("a.cpp", cpp, r.text, i))
         assertNotNull(EditGuard.checkFile("a.cpp", cpp, cpp, "add #include <QQuickItem>"))
     }
+
+    @Test fun callArgumentsMustBeKnownByTheScript() {
+        val files = mapOf("kit/kwm.py" to "def act(what):\n    if what == \"min\":\n        minimize()\n    elif what == \"close\":\n        close()\n")
+        assertNotNull(EditGuard.checkCalls("bindsym Mod4+Down exec python3 /x/kwm.py act min", "bindsym Mod4+Down exec python3 /x/kwm.py act minimize", files))
+        assertNull(EditGuard.checkCalls("bindsym Mod4+Down exec python3 /x/kwm.py act min", "bindsym Mod4+Down exec python3 /x/kwm.py act close", files))
+    }
 }

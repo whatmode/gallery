@@ -269,14 +269,8 @@ class Crew(
         }
         // Small model, big zip: rather than planning from a listing of every file, look at the
         // files the search found one part at a time and ask only "does this part need to change?".
-        val triaged = triage(task, ask, archive)
-        if (triaged.isNotEmpty()) {
-            val step = startStep(Role.PLANNER, "Plan · ${triaged.size} file${if (triaged.size == 1) "" else "s"} (checked part by part)")
-            endStep(step, triaged.joinToString("\n") { "${it.action.name} ${it.path}: ${it.instruction}" }, StepStatus.DONE)
-            DebugLog.d("crew", "triage plan: " + triaged.joinToString(" | ") { "${it.path}: ${it.instruction}" })
-            applyPlan(task, archive, triaged)
-            return
-        }
+        currentArchive = archive
+        if (fileAgents(task, ask, archive)) return
         val reply = call(Role.PLANNER, "Planning file changes", LlmRequest(
             system = config.prompts.editPlanner,
             prompt = "Task: $task\n" + docsBlock(Budget.DOCS_SHORT_CHARS) +
@@ -349,53 +343,86 @@ class Crew(
         finish(editSummary(archive, edits))
     }
 
+    /** The zip being edited, for checks that look across files. */
+    private var currentArchive: ArchiveInfo? = null
+
     /**
-     * Goes through the files the search ranked, a part at a time, and asks the model one small
-     * question per part: does this need to change for the task, and how (one sentence)? Parts are
-     * picked by how many of the request's words they contain, so the calls go where the code is.
-     * Returns the files to edit with what to do in each, best search match first; empty if nothing
-     * was found (then the ordinary planner runs).
+     * One agent per file. The files the search ranked (code before docs) are taken one at a time:
+     * the agent checks the file's best-matching parts ("does this need to change, and how?"), and
+     * if so edits that file right away, before the next agent starts. Each agent passes a
+     * one-line note on to the next, so a later file can follow what an earlier one changed.
+     * Returns false if no agent found anything (then the ordinary planner runs).
      */
-    private suspend fun triage(task: String, ask: String, archive: ArchiveInfo): List<EditParsing.PlannedEdit> {
-        if (searchHits.isEmpty()) return emptyList()
+    private suspend fun fileAgents(task: String, ask: String, archive: ArchiveInfo): Boolean {
+        if (searchHits.isEmpty()) return false
         val words = FileSearch.keywords(ask).ifEmpty { searchHits.flatMap { it.words }.distinct() }
         fun score(text: String): Int {
             val low = text.lowercase()
             return words.sumOf { w -> Regex(Regex.escape(w.lowercase())).findAll(low).count() }
         }
-        // The best parts of the best files: up to 2 parts per file, TRIAGE_CALLS calls in all.
-        val candidates = searchHits.take(TRIAGE_FILES).mapNotNull { hit ->
+        // Code and config first; docs only if the request is about them, data files last.
+        val docsAsked = DOCS_WORDS.containsMatchIn(ask)
+        fun kind(p: String): Int {
+            val e = p.substringAfterLast('/').substringAfterLast('.', "").lowercase()
+            return when {
+                e in DOC_EXTS -> if (docsAsked) 0 else 3
+                e in DATA_EXTS -> if (docsAsked) 0 else 2
+                else -> 0
+            }
+        }
+        val ranked = searchHits.withIndex().filter { kind(it.value.path) < 3 }
+            .sortedWith(compareBy({ kind(it.value.path) }, { it.index })).map { it.value }
+        val candidates = ranked.take(TRIAGE_FILES).mapNotNull { hit ->
             val text = archive.files[hit.path] ?: return@mapNotNull null
             val chunks = Chunker.split(text.replace("\r\n", "\n").removeSuffix("\n"))
             val best = chunks.map { it to score(it.text) }.filter { it.second > 0 || chunks.size == 1 }
                 .sortedByDescending { it.second }.take(2).map { it.first }.sortedBy { it.index }
             if (best.isEmpty()) null else Triple(hit.path, chunks.size, best)
         }
-        val found = linkedMapOf<String, MutableList<String>>()
+        if (candidates.isEmpty()) return false
+        DebugLog.d("crew", "file agents: " + candidates.joinToString { "${it.first} (${it.third.size} parts)" })
+
+        val edits = mutableListOf<FileEdit>()
+        val notes = mutableListOf<String>()
         var calls = 0
-        loop@ for ((path, total, parts) in candidates) {
+        for ((n, cand) in candidates.withIndex()) {
+            val (path, total, parts) = cand
+            if (edits.count { it.status == FileEdit.Status.DONE } >= config.maxSubtasks || calls >= TRIAGE_CALLS) break
+            val name = path.substringAfterLast('/')
+            val agent = "Agent ${n + 1} · $name"
+            val context = task + if (notes.isEmpty()) "" else "\n\nWhat the agents on other files found:\n" + notes.joinToString("\n") { "- $it" }
+            val what = mutableListOf<String>()
             for (c in parts) {
-                if (calls >= TRIAGE_CALLS || found.size >= config.maxSubtasks) break@loop
+                if (calls >= TRIAGE_CALLS) break
                 calls++
                 val where = if (total == 1) "" else " · part ${c.index + 1}/$total"
-                val reply = call(Role.PLANNER, "Checking ${path.substringAfterLast('/')}$where", LlmRequest(
+                val reply = call(Role.PLANNER, "$agent · checking$where", LlmRequest(
                     system = TRIAGE,
                     prompt = clip(
-                        "Task: $task\n\nFile `$path`" + (if (total == 1) "" else ", part ${c.index + 1} of $total (lines ${c.startLine + 1}–${c.endLine})") +
+                        "Task: $context\n\nFile `$path`" + (if (total == 1) "" else ", part ${c.index + 1} of $total (lines ${c.startLine + 1}–${c.endLine})") +
                             ":\n```\n${c.text}\n```\n\nDoes this code need to change to do the task? One line:",
                         Budget.PROMPT_CHARS,
                     ),
                     temperature = 0.1f, maxOutputTokens = 90,
                 ))
                 val change = parseTriage(reply)
-                retitleLast("Checking ${path.substringAfterLast('/')}$where · " + if (change == null) "no change here" else "needs a change")
-                if (change != null) found.getOrPut(path) { mutableListOf() } += change
+                retitleLast("$agent · checked$where · " + if (change == null) "no change here" else "needs a change")
+                if (change != null) what += change
             }
+            if (what.isEmpty()) {
+                notes += "$name: nothing to change"
+                continue
+            }
+            val instruction = clip(what.distinct().joinToString("; "), 400)
+            val e = editFile(context, path, archive.files.getValue(path), instruction)
+            edits += e
+            notes += "$name: " + (if (e.status == FileEdit.Status.DONE) "changed — $instruction" else "wanted to: $instruction (not applied: ${e.detail.take(80)})")
+            _state.update { it.copy(edits = edits.toList()) }
         }
-        DebugLog.d("crew", "triage: $calls calls over ${candidates.size} files, ${found.size} need changes")
-        return found.map { (path, what) ->
-            EditParsing.PlannedEdit(FileEdit.Action.EDIT, path, clip(what.distinct().joinToString("; "), 400))
-        }
+        DebugLog.d("crew", "file agents: $calls checks, ${edits.size} files tried, ${edits.count { it.status == FileEdit.Status.DONE }} changed")
+        if (edits.isEmpty()) return false
+        finish(editSummary(archive, edits))
+        return true
     }
 
     /** "CHANGE: make minimize() hide the window instead of calling home()" → the sentence; "NO" → null. */
@@ -489,7 +516,10 @@ class Crew(
                     continue
                 }
             }
-            val guard: (Patching.Block) -> String? = { b -> EditGuard.checkBlock(path, b.find, b.replace, instruction) }
+            val guard: (Patching.Block) -> String? = { b ->
+                EditGuard.checkBlock(path, b.find, b.replace, instruction)
+                    ?: currentArchive?.let { a -> EditGuard.checkCalls(b.find, b.replace, a.files) }
+            }
             var r = Patching.apply(current, blocks, check = guard)
             // Everything rejected: tell the Editor why and let it try once more.
             if (r.applied == 0 && r.failed.isNotEmpty()) {
@@ -782,7 +812,10 @@ class Crew(
         const val MAX_LOCATE_CHUNKS = 20
         /** Triage looks at this many of the best-matching files, with at most this many calls. */
         const val TRIAGE_FILES = 6
-        const val TRIAGE_CALLS = 10
+        const val TRIAGE_CALLS = 12
+        val DOC_EXTS = setOf("md", "markdown", "txt", "rst", "adoc")
+        val DATA_EXTS = setOf("json", "csv", "html", "htm", "svg", "xml", "log")
+        val DOCS_WORDS = Regex("""\b(readme|docs?|documentation|text|translat\w*|typo|wording|changelog|notes|version|json|html)\b""", RegexOption.IGNORE_CASE)
         const val TRIAGE =
             "You check one part of a file for a coding task. Reply with exactly one line:\n" +
                 "CHANGE: <what to change in this code, one sentence, naming the function or setting>\n" +
