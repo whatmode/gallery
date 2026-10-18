@@ -45,7 +45,7 @@ object LoadWatch {
             else -> "reason ${exit.reason}"
         }
         val mem = exit?.let { " · it was using ${it.pss / 1024} MB (rss ${it.rss / 1024} MB)" }.orEmpty()
-        val msg = "The app closed while loading $what: $reason$mem. Try a smaller \\"Max tokens\\" (⚙ at the top right), " +
+        val msg = "The app closed while loading $what: $reason$mem. Try a smaller \"Max tokens\" (⚙ at the top right), " +
             "the CPU instead of the GPU, or a smaller model."
         DebugLog.dSync("model", "LAST LOAD FAILED · $what · exit ${exit?.reason} ${exit?.description.orEmpty()}$mem")
         _lastCrash.value = msg
